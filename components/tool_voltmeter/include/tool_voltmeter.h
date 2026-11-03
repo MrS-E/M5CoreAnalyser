@@ -30,7 +30,7 @@ extern "C" {
 #define VOLTMETER_MAX_BATCH_SAMPLES        (256)
 #define VOLTMETER_DEFAULT_MOVING_AVG_LEN   (16)
 #define VOLTMETER_MAX_MOVING_AVG_LEN       (128)
-#define VOLTMETER_DEFAULT_SAMPLE_RATE_HZ   (16000)
+#define VOLTMETER_DEFAULT_SAMPLE_RATE_HZ   (16000) /**< Nominal speaker-monitor output rate, not ADC/recorder rate */
 #define VOLTMETER_RANGE_MIN_MV             (0.0f)
 #define VOLTMETER_RANGE_MAX_MV             (3300.0f)
 #define VOLTMETER_CLAMP_MAX_MV             (3600.0f)

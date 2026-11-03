@@ -296,8 +296,17 @@ void tool_voltmeter_set_sample_source(voltmeter_sample_source_fn_t fn, void *use
     portEXIT_CRITICAL(&s_volt_lock);
 }
 
-static esp_err_t read_adc_batch(gpio_num_t pin, uint16_t *out_raw, float *out_mv, size_t count)
+static esp_err_t read_adc_batch(gpio_num_t pin,
+                               uint16_t *out_raw,
+                               float *out_mv,
+                               size_t count,
+                               uint32_t *out_sample_rate_hz,
+                               uint64_t *out_timestamp_us)
 {
+    if (out_sample_rate_hz == NULL || out_timestamp_us == NULL || count == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     voltmeter_sample_source_fn_t custom_fn = NULL;
     void *custom_ctx = NULL;
     portENTER_CRITICAL(&s_volt_lock);
@@ -305,16 +314,21 @@ static esp_err_t read_adc_batch(gpio_num_t pin, uint16_t *out_raw, float *out_mv
     custom_ctx = s_custom_source_ctx;
     portEXIT_CRITICAL(&s_volt_lock);
 
+    int64_t batch_start_us = esp_timer_get_time();
+    *out_timestamp_us = (uint64_t)batch_start_us;
+    *out_sample_rate_hz = 0U;
     if (custom_fn != NULL) {
-        return custom_fn(pin, out_raw, out_mv, count, custom_ctx);
+        return custom_fn(pin, out_raw, out_mv, count, out_sample_rate_hz, custom_ctx);
     }
 
+    int64_t last_sample_us = 0;
     for (size_t i = 0; i < count; ++i) {
         int raw = 0;
         int mv = 0;
         if (bsp_adc1_read_raw(pin, &raw) != ESP_OK) {
             raw = 0;
         }
+        int64_t sample_time_us = esp_timer_get_time();
         if (raw < 0) {
             raw = 0;
         } else if (raw > 4095) {
@@ -325,6 +339,18 @@ static esp_err_t read_adc_batch(gpio_num_t pin, uint16_t *out_raw, float *out_mv
         }
         out_raw[i] = (uint16_t)raw;
         out_mv[i] = (float)mv;
+        last_sample_us = sample_time_us;
+        if (i == 0U) {
+            batch_start_us = sample_time_us;
+            *out_timestamp_us = (uint64_t)sample_time_us;
+        }
+    }
+
+    int64_t elapsed_us = last_sample_us - batch_start_us;
+    if (count > 1U && elapsed_us > 0) {
+        uint64_t rate_numerator = (uint64_t)(count - 1U) * 1000000ULL;
+        uint64_t rate_hz = (rate_numerator + (uint64_t)elapsed_us / 2U) / (uint64_t)elapsed_us;
+        *out_sample_rate_hz = (rate_hz > UINT32_MAX) ? UINT32_MAX : (uint32_t)rate_hz;
     }
     return ESP_OK;
 }
@@ -349,7 +375,14 @@ static esp_err_t voltmeter_worker_step(void *ctx)
     }
 
     const size_t batch_count = VOLTMETER_DEFAULT_BATCH_SAMPLES;
-    esp_err_t err = read_adc_batch(pin, s_raw_batch, s_mv_batch, batch_count);
+    uint32_t batch_sample_rate_hz = 0U;
+    uint64_t batch_timestamp_us = 0U;
+    esp_err_t err = read_adc_batch(pin,
+                                   s_raw_batch,
+                                   s_mv_batch,
+                                   batch_count,
+                                   &batch_sample_rate_hz,
+                                   &batch_timestamp_us);
     if (err != ESP_OK) {
         return err;
     }
@@ -361,8 +394,8 @@ static esp_err_t voltmeter_worker_step(void *ctx)
     if (recorder_sink_is_recording()) {
         recorder_frame_t rec_frame = {
             .tool_id = VOLTMETER_TOOL_ID,
-            .sample_rate_hz = VOLTMETER_DEFAULT_SAMPLE_RATE_HZ,
-            .timestamp_us = (uint64_t)esp_timer_get_time(),
+            .sample_rate_hz = batch_sample_rate_hz,
+            .timestamp_us = batch_timestamp_us,
             .samples = s_raw_batch,
             .sample_count = batch_count,
             .bytes_per_sample = sizeof(uint16_t),

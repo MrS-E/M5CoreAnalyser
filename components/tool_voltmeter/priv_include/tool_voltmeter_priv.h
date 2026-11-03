@@ -18,6 +18,7 @@ typedef esp_err_t (*voltmeter_sample_source_fn_t)(gpio_num_t pin,
                                                   uint16_t *out_raw,
                                                   float *out_uncal_mv,
                                                   size_t count,
+                                                  uint32_t *out_sample_rate_hz,
                                                   void *user_ctx);
 
 /**
