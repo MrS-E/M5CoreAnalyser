@@ -17,6 +17,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lvgl.h"
 #include "psram_buffer.h"
 #include "recorder_sink.h"
@@ -214,42 +215,47 @@ void tool_scope_set_sample_source(scope_sample_source_fn_t fn, void *user_ctx)
 }
 
 /**
- * @brief Compute capture sample count and inter-sample delay for the active timebase.
+ * @brief Compute capture size and target sample interval for the active timebase.
  */
 static void get_capture_params(scope_timebase_t tb,
                                size_t *out_sample_count,
-                               uint32_t *out_delay_us,
+                               uint32_t *out_interval_ns,
                                uint32_t *out_decim_step)
 {
-    uint32_t us_per_div = scope_dsp_timebase_us_per_div(tb);
-    /* Desired time per display point = us_per_div / 30 */
-    uint32_t target_point_us = us_per_div / SCOPE_POINTS_PER_DIV;
-    uint32_t delay_us = 0U;
-    uint32_t decim = 1U;
-
-    if (target_point_us <= 20U) {
-        delay_us = 0U;
-        decim = 1U;
-    } else if (target_point_us <= 200U) {
-        delay_us = target_point_us / 2U;
-        decim = 2U;
-    } else {
-        /* Cap total blocking capture time per worker cycle to ~15 ms while still spanning window */
-        delay_us = 20U;
-        decim = 1U;
-    }
-
-    size_t needed = (size_t)SCOPE_CHART_POINTS * (size_t)decim * 2U;
-    if (needed < 640U) {
-        needed = 640U;
-    }
+    /* 150 samples on either side leave a full 300-point window around a valid trigger. */
+    size_t needed = SCOPE_CHART_POINTS + (SCOPE_CHART_POINTS / 2U);
     if (needed > SCOPE_CAPTURE_BUF_SAMPLES) {
         needed = SCOPE_CAPTURE_BUF_SAMPLES;
     }
 
     *out_sample_count = needed;
-    *out_delay_us = delay_us;
-    *out_decim_step = decim;
+    *out_interval_ns = scope_dsp_target_sample_interval_ns(tb);
+    *out_decim_step = 1U;
+}
+
+static void wait_until_us(int64_t deadline_us)
+{
+    int64_t remaining_us = deadline_us - esp_timer_get_time();
+    while (remaining_us >= 1000) {
+        TickType_t sleep_ticks = pdMS_TO_TICKS((uint32_t)(remaining_us / 1000));
+        if (sleep_ticks == 0) {
+            sleep_ticks = 1;
+        }
+        vTaskDelay(sleep_ticks);
+        remaining_us = deadline_us - esp_timer_get_time();
+    }
+
+    if (remaining_us > 0) {
+        esp_rom_delay_us((uint32_t)remaining_us);
+    }
+}
+
+static int64_t sample_deadline_us(int64_t first_sample_us,
+                                  size_t sample_index,
+                                  uint32_t interval_ns)
+{
+    uint64_t elapsed_ns = (uint64_t)sample_index * interval_ns;
+    return first_sample_us + (int64_t)((elapsed_ns + 500ULL) / 1000ULL);
 }
 
 static esp_err_t capture_adc_buffer(gpio_num_t pin,
@@ -258,7 +264,8 @@ static esp_err_t capture_adc_buffer(gpio_num_t pin,
                                     uint16_t *out_mv,
                                     size_t *out_count,
                                     uint32_t *out_sample_rate_hz,
-                                    uint32_t *out_decim_step)
+                                    uint32_t *out_decim_step,
+                                    uint64_t *out_timestamp_us)
 {
     scope_sample_source_fn_t custom_fn = NULL;
     void *custom_ctx = NULL;
@@ -268,26 +275,33 @@ static esp_err_t capture_adc_buffer(gpio_num_t pin,
     portEXIT_CRITICAL(&s_scope_lock);
 
     size_t cap_count = 0;
-    uint32_t delay_us = 0;
+    uint32_t interval_ns = 0;
     uint32_t decim_step = 1;
-    get_capture_params(tb, &cap_count, &delay_us, &decim_step);
+    get_capture_params(tb, &cap_count, &interval_ns, &decim_step);
 
     if (custom_fn != NULL) {
-        uint32_t custom_fs = 30000U;
+        uint32_t custom_fs = 0U;
+        *out_timestamp_us = (uint64_t)esp_timer_get_time();
         esp_err_t err = custom_fn(pin, out_raw, out_mv, cap_count, &custom_fs, custom_ctx);
         *out_count = cap_count;
-        *out_sample_rate_hz = (custom_fs > 0U) ? custom_fs : 30000U;
+        *out_sample_rate_hz = custom_fs;
         *out_decim_step = decim_step;
         return err;
     }
 
-    int64_t t_start = esp_timer_get_time();
+    int64_t first_sample_us = 0;
+    int64_t last_sample_us = 0;
     for (size_t i = 0; i < cap_count; ++i) {
+        if (i > 0U && interval_ns >= 1000000U) {
+            wait_until_us(sample_deadline_us(first_sample_us, i, interval_ns));
+        }
+
         int raw = 0;
         int mv = 0;
         if (bsp_adc1_read_raw(pin, &raw) != ESP_OK) {
             raw = 0;
         }
+        int64_t sample_time_us = esp_timer_get_time();
         if (raw < 0) {
             raw = 0;
         } else if (raw > 4095) {
@@ -303,22 +317,22 @@ static esp_err_t capture_adc_buffer(gpio_num_t pin,
         }
         out_raw[i] = (uint16_t)raw;
         out_mv[i] = (uint16_t)mv;
-        if (delay_us > 0U) {
-            esp_rom_delay_us(delay_us);
+        last_sample_us = sample_time_us;
+        if (i == 0U) {
+            first_sample_us = last_sample_us;
         }
     }
-    int64_t elapsed_us = esp_timer_get_time() - t_start;
-    uint32_t fs_hz = 25000U;
-    if (elapsed_us > 0 && cap_count > 1U) {
-        uint64_t calc = ((uint64_t)cap_count * 1000000ULL) / (uint64_t)elapsed_us;
-        if (calc >= 100ULL && calc <= 500000ULL) {
-            fs_hz = (uint32_t)calc;
-        }
+    int64_t elapsed_us = last_sample_us - first_sample_us;
+    if (elapsed_us <= 0 || cap_count < 2U) {
+        return ESP_ERR_INVALID_STATE;
     }
+    uint64_t rate_numerator = (uint64_t)(cap_count - 1U) * 1000000ULL;
+    uint64_t rate_hz = (rate_numerator + (uint64_t)elapsed_us / 2U) / (uint64_t)elapsed_us;
 
     *out_count = cap_count;
-    *out_sample_rate_hz = fs_hz;
+    *out_sample_rate_hz = (rate_hz > UINT32_MAX) ? UINT32_MAX : (uint32_t)rate_hz;
     *out_decim_step = decim_step;
+    *out_timestamp_us = (uint64_t)first_sample_us;
     return ESP_OK;
 }
 
@@ -345,8 +359,9 @@ static esp_err_t scope_worker_step(void *ctx)
     size_t captured = 0;
     uint32_t fs_hz = 0;
     uint32_t decim_step = 1;
+    uint64_t capture_timestamp_us = 0;
     esp_err_t err = capture_adc_buffer(
-        pin, tb, s_raw_ring_buf, s_mv_ring_buf, &captured, &fs_hz, &decim_step);
+        pin, tb, s_raw_ring_buf, s_mv_ring_buf, &captured, &fs_hz, &decim_step, &capture_timestamp_us);
     if (err != ESP_OK || captured < 2U) {
         return err;
     }
@@ -360,7 +375,7 @@ static esp_err_t scope_worker_step(void *ctx)
         recorder_frame_t rec_frame = {
             .tool_id = SCOPE_TOOL_ID,
             .sample_rate_hz = fs_hz,
-            .timestamp_us = (uint64_t)esp_timer_get_time(),
+            .timestamp_us = capture_timestamp_us,
             .samples = s_raw_ring_buf,
             .sample_count = captured,
             .bytes_per_sample = sizeof(uint16_t),
@@ -405,6 +420,7 @@ static esp_err_t scope_worker_step(void *ctx)
         wptr->trig_level_mv = tlvl;
         wptr->pin = pin;
         wptr->sample_rate_hz = fs_hz;
+        wptr->viewport_us = scope_dsp_viewport_us(fs_hz, decim_step, SCOPE_CHART_POINTS);
 
         portENTER_CRITICAL(&s_scope_lock);
         s_latest_frame = *wptr;
@@ -590,6 +606,31 @@ static void build_scope_ui(lv_obj_t *parent)
     lv_obj_center(s_btn_pin_lbl);
 }
 
+static void format_effective_timebase(const scope_frame_t *frame, char *out_text, size_t out_len)
+{
+    if (frame == NULL || out_text == NULL || out_len == 0U) {
+        return;
+    }
+
+    uint32_t requested_us_div = scope_dsp_timebase_us_per_div(frame->timebase);
+    uint32_t actual_us_div = (frame->viewport_us + (SCOPE_HORIZ_DIVS / 2U)) / SCOPE_HORIZ_DIVS;
+    uint32_t tolerance_us = requested_us_div / 20U;
+    if (actual_us_div > 0U &&
+        (actual_us_div > requested_us_div ? actual_us_div - requested_us_div
+                                         : requested_us_div - actual_us_div) <= tolerance_us) {
+        (void)snprintf(out_text, out_len, "%s", scope_dsp_timebase_to_str(frame->timebase));
+    } else if (actual_us_div < 1000U) {
+        (void)snprintf(out_text, out_len, "~%luus/d", (unsigned long)actual_us_div);
+    } else {
+        uint32_t tenths_ms = (actual_us_div + 50U) / 100U;
+        (void)snprintf(out_text,
+                       out_len,
+                       "~%lu.%lums/d",
+                       (unsigned long)(tenths_ms / 10U),
+                       (unsigned long)(tenths_ms % 10U));
+    }
+}
+
 static void scope_on_ui_refresh(void *ctx)
 {
     (void)ctx;
@@ -601,16 +642,17 @@ static void scope_on_ui_refresh(void *ctx)
 
     bool running = tool_scope_is_running();
     gpio_num_t pin = tool_scope_get_pin();
-    scope_timebase_t tb = tool_scope_get_timebase();
     scope_vscale_t vs = tool_scope_get_vscale();
     scope_trig_mode_t tmode = tool_scope_get_trig_mode();
     uint16_t tlvl = tool_scope_get_trig_level_mv();
+    char effective_tb[24];
+    format_effective_timebase(&frame, effective_tb, sizeof(effective_tb));
 
     if (s_lbl_top_status != NULL) {
         lv_label_set_text_fmt(s_lbl_top_status,
                               "G%d %s %s T:%d.%02dV",
                               (int)pin,
-                              scope_dsp_timebase_to_str(tb),
+                              effective_tb,
                               scope_dsp_vscale_to_str(vs),
                               (int)(tlvl / 1000U),
                               (int)((tlvl % 1000U) / 10U));
@@ -676,7 +718,7 @@ static void scope_on_ui_refresh(void *ctx)
         lv_label_set_text(s_btn_run_lbl, running ? "RUN" : "STOP");
     }
     if (s_btn_tb_lbl != NULL) {
-        lv_label_set_text(s_btn_tb_lbl, scope_dsp_timebase_to_str(tb));
+        lv_label_set_text(s_btn_tb_lbl, effective_tb);
     }
     if (s_btn_vs_lbl != NULL) {
         lv_label_set_text(s_btn_vs_lbl, scope_dsp_vscale_to_str(vs));

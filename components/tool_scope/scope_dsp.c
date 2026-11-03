@@ -58,6 +58,32 @@ uint32_t scope_dsp_timebase_us_per_div(scope_timebase_t tb)
     return s_tb_us_per_div[tb];
 }
 
+uint32_t scope_dsp_target_sample_interval_ns(scope_timebase_t tb)
+{
+    if (tb < 0 || tb >= SCOPE_TB_COUNT) {
+        return 0U;
+    }
+
+    uint64_t viewport_ns = (uint64_t)s_tb_us_per_div[tb] * SCOPE_HORIZ_DIVS * 1000ULL;
+    uint64_t interval_ns = (viewport_ns + (SCOPE_CHART_POINTS - 1U) / 2U) /
+                           (SCOPE_CHART_POINTS - 1U);
+    return (interval_ns > UINT32_MAX) ? UINT32_MAX : (uint32_t)interval_ns;
+}
+
+uint32_t scope_dsp_viewport_us(uint32_t sample_rate_hz,
+                               uint32_t decimation_step,
+                               size_t window_points)
+{
+    if (sample_rate_hz == 0U || decimation_step == 0U || window_points < 2U) {
+        return 0U;
+    }
+
+    uint64_t duration_numerator = (uint64_t)(window_points - 1U) *
+                                  decimation_step * 1000000ULL;
+    uint64_t duration_us = (duration_numerator + sample_rate_hz / 2U) / sample_rate_hz;
+    return (duration_us > UINT32_MAX) ? UINT32_MAX : (uint32_t)duration_us;
+}
+
 const char *scope_dsp_timebase_to_str(scope_timebase_t tb)
 {
     if (tb < 0 || tb >= SCOPE_TB_COUNT) {

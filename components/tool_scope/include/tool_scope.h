@@ -116,6 +116,7 @@ typedef struct {
     uint16_t trig_level_mv;               /**< Active trigger threshold in mV */
     gpio_num_t pin;                       /**< Active input pin (`GPIO36` or `GPIO35`) */
     uint32_t sample_rate_hz;              /**< Effective capture sample rate in Hz */
+    uint32_t viewport_us;                  /**< Actual displayed 300-point horizontal span in microseconds */
 } scope_frame_t;
 
 /* --------------------------------------------------------------------------
@@ -129,6 +130,26 @@ typedef struct {
  * @return Microseconds per division (`100`..`100000`).
  */
 uint32_t scope_dsp_timebase_us_per_div(scope_timebase_t tb);
+
+/**
+ * @brief Return the requested sample interval that spans 10 divisions across the chart endpoints.
+ *
+ * @param[in] tb Target timebase enum value.
+ * @return Target interval in nanoseconds, or zero for an invalid timebase.
+ */
+uint32_t scope_dsp_target_sample_interval_ns(scope_timebase_t tb);
+
+/**
+ * @brief Compute the measured horizontal viewport for a uniformly sampled display window.
+ *
+ * @param[in] sample_rate_hz Effective raw capture sample rate in Hz.
+ * @param[in] decimation_step Raw samples between display points (>= 1).
+ * @param[in] window_points Number of displayed points (>= 2).
+ * @return Displayed endpoint-to-endpoint duration in microseconds, or zero for invalid inputs.
+ */
+uint32_t scope_dsp_viewport_us(uint32_t sample_rate_hz,
+                               uint32_t decimation_step,
+                               size_t window_points);
 
 /**
  * @brief Return a compact display string for `tb` (e.g. `"1ms/d"`, `"100us/d"`).
