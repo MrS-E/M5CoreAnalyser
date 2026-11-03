@@ -22,10 +22,10 @@
 - When `tool_core_stop_active_tool(true)` is called on a background-capable generator, its peripheral and GPIO claims remain active while `tool_core` tracks it in the background list (`tool_core_get_background_tools`).
 - When a tool stops with `keep_background == false` (or when a non-background tool exits), `tool_core` automatically releases any remaining GPIOs owned by that tool via `bsp_pin_release_all_for_owner()` and disables speaker passthrough if no remaining active/background tool requires it.
 
-### 3. PSRAM Ping-Pong Double Buffer (`psram_buffer.c`)
-- `psram_double_buf_alloc()` allocates two equal-sized sample buffers (`buf_a` and `buf_b`) in 8 MB PSRAM (`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT`, with fallback to default 8-bit heap in PSRAM-less test environments).
-- Core 1 writes into `psram_double_buf_get_write_ptr()` and calls `psram_double_buf_swap()` under spinlock (`portMUX_TYPE`) to flip `active_write_idx` and set `frame_ready = true`.
-- Core 0 reads completed frames via `psram_double_buf_consume_ready()` or copies out tear-free frames via `psram_double_buf_read_copy()`.
+### 3. Tear-Free 3-Slot PSRAM Sample Buffer (`psram_buffer.c`)
+- `psram_double_buf_alloc()` allocates three equal-sized sample buffer slots (`buf_a`, `buf_b`, `buf_c`) indexed by `active_write_idx`, `ready_idx`, and `active_read_idx` (always a permutation of `{0, 1, 2}`). Memory is allocated using compile-time `#if CONFIG_SPIRAM` selection (`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` in production firmware, `MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT` when `CONFIG_SPIRAM=n` in QEMU).
+- **Core 1 Producer**: Writes into `psram_double_buf_get_write_ptr()` (`active_write_idx`) and calls `psram_double_buf_swap()` to atomically exchange `active_write_idx <-> ready_idx` and set `frame_ready = true` under `dbuf->spinlock`. The producer never touches `active_read_idx`.
+- **Core 0 Consumer**: Acquires or latches the ready frame (`active_read_idx <-> ready_idx`) via `psram_double_buf_acquire_read()` / `psram_double_buf_release_read()`, `psram_double_buf_consume_ready()`, or `psram_double_buf_read_copy()`. In `psram_double_buf_read_copy()`, `dbuf->spinlock` is held only for the index exchange and `reader_busy` flag update while `memcpy` executes outside the critical section, preventing both frame tearing and long interrupt-disabled stalls.
 
 ### 4. Core 1 Worker Task Helper & Self-Test Seam
 - `tool_worker_start()` pins an acquisition/DSP task to **Core 1 (`APP_CPU`)** and `tool_worker_stop()` signals termination and awaits a binary completion semaphore before freeing the worker context.
@@ -52,12 +52,14 @@ Headers: [`include/tool_core.h`](include/tool_core.h), [`include/psram_buffer.h`
   - `size_t tool_core_get_background_tools(const analyser_tool_t **out_tools, size_t max_tools)`
   - `size_t tool_core_get_background_count(void)`
   - `void tool_core_ui_refresh_active(void)`
-- **PSRAM Double Buffer**:
+- **PSRAM Double/Triple Buffer**:
   - `esp_err_t psram_double_buf_alloc(psram_double_buf_t *dbuf, size_t capacity_samples, size_t sample_size)`
   - `void psram_double_buf_free(psram_double_buf_t *dbuf)`
   - `void *psram_double_buf_get_write_ptr(psram_double_buf_t *dbuf)`
   - `const void *psram_double_buf_get_read_ptr(psram_double_buf_t *dbuf)`
   - `esp_err_t psram_double_buf_swap(psram_double_buf_t *dbuf)`
+  - `bool psram_double_buf_acquire_read(psram_double_buf_t *dbuf, const void **out_read_ptr)`
+  - `void psram_double_buf_release_read(psram_double_buf_t *dbuf)`
   - `bool psram_double_buf_consume_ready(psram_double_buf_t *dbuf, const void **out_read_ptr)`
   - `esp_err_t psram_double_buf_read_copy(psram_double_buf_t *dbuf, void *dst_buf, size_t max_samples, size_t *out_copied)`
 - **Core 1 Worker & Self-Test**:

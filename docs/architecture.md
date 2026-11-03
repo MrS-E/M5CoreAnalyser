@@ -52,12 +52,12 @@ graph TD
 
 ---
 
-## 3. PSRAM Double-Buffer Pipeline (`psram_buffer.h`)
+## 3. Tear-Free 3-Slot PSRAM Buffer Pipeline (`psram_buffer.h`)
 
-To avoid UI stalls and prevent tearing between Core 1 producers and Core 0 LVGL consumers:
-1. `psram_double_buf_alloc()` allocates two equal-sized sample buffers (`buf_a` and `buf_b`) in the M5Stack Core2's **8 MB PSRAM** (`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT`).
-2. **Core 1 Producer**: Acquires the current back-buffer pointer via `psram_double_buf_get_write_ptr()`, fills it with processed samples, and calls `psram_double_buf_swap()` to atomically flip `active_write_idx` and set `frame_ready = true` under spinlock (`portMUX_TYPE`).
-3. **Core 0 Consumer**: During `on_ui_refresh()`, calls `psram_double_buf_read_copy()` (or `psram_double_buf_consume_ready()`) to copy out the completed front buffer without tearing and updates LVGL charts/labels.
+To avoid UI stalls, prevent frame tearing between Core 1 producers and Core 0 LVGL consumers, and avoid holding spinlocks during large PSRAM `memcpy` transfers:
+1. `psram_double_buf_alloc()` allocates three equal-sized sample buffer slots (`buf_a`, `buf_b`, `buf_c`) indexed by `active_write_idx`, `ready_idx`, and `active_read_idx` (always a permutation of `{0, 1, 2}`), using compile-time `#if CONFIG_SPIRAM` selection (`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` in production firmware).
+2. **Core 1 Producer**: Acquires the current write slot via `psram_double_buf_get_write_ptr()`, fills it with processed samples, and calls `psram_double_buf_swap()` to atomically exchange `active_write_idx <-> ready_idx` and set `frame_ready = true` under `dbuf->spinlock`. Because the producer never touches `active_read_idx`, Core 1 swaps never overwrite the buffer currently held by Core 0.
+3. **Core 0 Consumer**: During `on_ui_refresh()`, calls `psram_double_buf_acquire_read()`/`psram_double_buf_release_read()`, `psram_double_buf_consume_ready()`, or `psram_double_buf_read_copy()`. In `psram_double_buf_read_copy()`, the spinlock is held only for the index exchange (`active_read_idx <-> ready_idx`) and `reader_busy` flag update, while the `memcpy` executes outside the critical section.
 
 ---
 
