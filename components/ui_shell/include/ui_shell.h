@@ -42,15 +42,15 @@ typedef struct {
     char title[32];                   /**< Displayed screen/instrument title */
     bool bg_pill_visible;             /**< True when >= 1 background generator is active */
     size_t bg_tool_count;             /**< Count of active background generators */
-    char bg_pill_text[24];            /**< Formatted background indicator pill label */
+    char bg_pill_text[24];            /**< Formatted background indicator pill label (`"BG:wave"`, `"BG:2"`) */
     bool spk_supported;               /**< True if active or background tool supports speaker audio */
     bool spk_enabled;                 /**< True if speaker passthrough is active and unmuted */
     bool spk_muted;                   /**< True if speaker passthrough is muted */
-    char spk_badge_text[16];          /**< Formatted speaker button label (`"SPK ON"`, `"SPK MUTE"`, `"SPK OFF"`) */
+    char spk_badge_text[16];          /**< Formatted speaker button label (`"SPK1"`, `"MUTE"`, `"SPK0"`, `"SPK-"`) */
     recorder_mode_t rec_mode;         /**< Current recorder sink mode (`OFF`, `USB_STUB`, `BT_STUB`) */
     recorder_mode_t rec_transport;    /**< Selected recorder transport (`USB_STUB` or `BT_STUB`) */
     uint32_t rec_frames;              /**< Total recorded frames from `recorder_sink` */
-    char rec_badge_text[24];          /**< Formatted record button text (`"REC OFF"`, `"REC USB #12"`, etc.) */
+    char rec_badge_text[24];          /**< Formatted record button text (`"REC"`, `"#12"`, etc.) */
     char transport_badge_text[8];     /**< Formatted transport selector badge (`"USB"` or `"BT"`) */
     uint16_t battery_mv;              /**< Battery voltage in millivolts from AXP192 */
     uint8_t battery_pct;              /**< Battery state-of-charge percentage (`0..100`) */

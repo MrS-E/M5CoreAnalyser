@@ -11,6 +11,7 @@
 
 #include "bsp_m5core2.h"
 #include "esp_heap_caps.h"
+#include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -29,6 +30,7 @@ static ui_header_state_t s_last_header_state;
 static char s_last_status_msg[UI_SHELL_STATUS_MSG_MAX] = "Ready";
 
 static bool s_ui_initialized = false;
+static bool s_async_flush_cb_registered = false;
 static TaskHandle_t s_ui_task_handle = NULL;
 static lv_display_t *s_lv_disp = NULL;
 static lv_indev_t *s_lv_indev = NULL;
@@ -77,6 +79,19 @@ static uint32_t lvgl_tick_ms_cb(void)
     return (uint32_t)(esp_timer_get_time() / 1000LL);
 }
 
+static bool lvgl_on_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
+                                        esp_lcd_panel_io_event_data_t *edata,
+                                        void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    lv_display_t *disp = (lv_display_t *)user_ctx;
+    if (disp != NULL) {
+        lv_display_flush_ready(disp);
+    }
+    return false;
+}
+
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     esp_lcd_panel_handle_t panel = bsp_display_get_panel();
@@ -89,7 +104,11 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
         /* Swap RGB565 byte order for SPI ILI9342C big-endian pixel transfer */
         uint32_t px_count = (uint32_t)(x2 - x1) * (uint32_t)(y2 - y1);
         lv_draw_sw_rgb565_swap(px_map, px_count);
-        (void)esp_lcd_panel_draw_bitmap(panel, x1, y1, x2, y2, px_map);
+        esp_err_t err = esp_lcd_panel_draw_bitmap(panel, x1, y1, x2, y2, px_map);
+        if (err == ESP_OK && s_async_flush_cb_registered) {
+            /* lv_display_flush_ready(disp) will be signaled from lvgl_on_color_trans_done_cb */
+            return;
+        }
     }
     lv_display_flush_ready(disp);
 }
@@ -247,6 +266,16 @@ esp_err_t ui_shell_init(void)
                            UI_DRAW_BUF_PIXELS * sizeof(uint16_t),
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
+    esp_lcd_panel_io_handle_t panel_io = bsp_display_get_panel_io();
+    if (panel_io != NULL) {
+        const esp_lcd_panel_io_callbacks_t io_cbs = {
+            .on_color_trans_done = lvgl_on_color_trans_done_cb,
+        };
+        if (esp_lcd_panel_io_register_event_callbacks(panel_io, &io_cbs, s_lv_disp) == ESP_OK) {
+            s_async_flush_cb_registered = true;
+        }
+    }
+
     s_lv_indev = lv_indev_create();
     if (s_lv_indev != NULL) {
         lv_indev_set_type(s_lv_indev, LV_INDEV_TYPE_POINTER);
@@ -360,12 +389,44 @@ esp_err_t ui_shell_open_tool(const char *tool_id)
         return ESP_ERR_INVALID_ARG;
     }
 
+    const analyser_tool_t *target = tool_registry_find(tool_id);
+    if (target == NULL) {
+        char msg[UI_SHELL_STATUS_MSG_MAX];
+        (void)snprintf(msg, sizeof(msg), "Failed to open '%s': ESP_ERR_NOT_FOUND", tool_id);
+        set_status_msg(msg);
+        refresh_header_snapshot();
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    const analyser_tool_t *active = tool_core_get_active_tool();
+    if (active == target) {
+        if (s_launcher_cont != NULL && s_tool_cont != NULL) {
+            lv_obj_add_flag(s_launcher_cont, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_tool_cont, LV_OBJ_FLAG_HIDDEN);
+        }
+        refresh_header_snapshot();
+        return ESP_OK;
+    }
+
+    /* Stop the previous foreground tool BEFORE cleaning s_tool_cont so its on_stop()
+     * callback can safely access/detach its own LVGL child widgets before deletion. */
+    if (active != NULL) {
+        (void)tool_core_stop_active_tool(false);
+    }
+
     if (s_tool_cont != NULL) {
         lv_obj_clean(s_tool_cont);
     }
 
     esp_err_t err = tool_core_start_tool(tool_id, s_tool_cont);
     if (err != ESP_OK) {
+        if (s_tool_cont != NULL) {
+            lv_obj_clean(s_tool_cont);
+            lv_obj_add_flag(s_tool_cont, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_launcher_cont != NULL) {
+            lv_obj_clear_flag(s_launcher_cont, LV_OBJ_FLAG_HIDDEN);
+        }
         char msg[UI_SHELL_STATUS_MSG_MAX];
         if (err == ESP_ERR_INVALID_STATE) {
             (void)snprintf(msg, sizeof(msg), "Pin conflict starting '%s' (check BG GEN)", tool_id);
@@ -383,7 +444,7 @@ esp_err_t ui_shell_open_tool(const char *tool_id)
     }
 
     char ok_msg[UI_SHELL_STATUS_MSG_MAX];
-    const analyser_tool_t *active = tool_core_get_active_tool();
+    active = tool_core_get_active_tool();
     (void)snprintf(ok_msg, sizeof(ok_msg), "Opened %s", (active != NULL) ? active->title : tool_id);
     set_status_msg(ok_msg);
     refresh_header_snapshot();
@@ -480,4 +541,14 @@ esp_err_t ui_shell_get_last_status_msg(char *out_buf, size_t buf_len)
 lv_obj_t *ui_shell_get_tool_container(void)
 {
     return s_tool_cont;
+}
+
+lv_obj_t *ui_shell_get_launcher_container(void)
+{
+    return s_launcher_cont;
+}
+
+lv_obj_t *ui_shell_get_launcher_grid(void)
+{
+    return s_launcher_grid;
 }

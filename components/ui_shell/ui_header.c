@@ -64,9 +64,9 @@ void ui_header_format_bg_pill(size_t bg_count,
     }
 
     if (bg_count == 1 && first_bg_id != NULL && first_bg_id[0] != '\0') {
-        (void)snprintf(out_buf, buf_len, "BG:%s", first_bg_id);
+        (void)snprintf(out_buf, buf_len, "BG:%.4s", first_bg_id);
     } else {
-        (void)snprintf(out_buf, buf_len, "BG GEN(%u)", (unsigned)bg_count);
+        (void)snprintf(out_buf, buf_len, "BG:%u", (unsigned)bg_count);
     }
 }
 
@@ -81,13 +81,13 @@ void ui_header_format_spk_badge(bool supported,
     }
 
     if (!supported) {
-        (void)snprintf(out_buf, buf_len, "SPK N/A");
+        (void)snprintf(out_buf, buf_len, "SPK-");
     } else if (!enabled) {
-        (void)snprintf(out_buf, buf_len, "SPK OFF");
+        (void)snprintf(out_buf, buf_len, "SPK0");
     } else if (muted) {
-        (void)snprintf(out_buf, buf_len, "SPK MUTE");
+        (void)snprintf(out_buf, buf_len, "MUTE");
     } else {
-        (void)snprintf(out_buf, buf_len, "SPK ON");
+        (void)snprintf(out_buf, buf_len, "SPK1");
     }
 }
 
@@ -112,14 +112,10 @@ void ui_header_format_rec_badge(recorder_mode_t mode,
     }
 
     if (out_rec_buf != NULL && rec_len > 0) {
-        if (mode == REC_MODE_OFF) {
-            if (frames > 0) {
-                (void)snprintf(out_rec_buf, rec_len, "REC OFF #%u", (unsigned)frames);
-            } else {
-                (void)snprintf(out_rec_buf, rec_len, "REC OFF");
-            }
+        if (mode == REC_MODE_OFF && frames == 0) {
+            (void)snprintf(out_rec_buf, rec_len, "REC");
         } else {
-            (void)snprintf(out_rec_buf, rec_len, "REC %s #%u", mode_str, (unsigned)frames);
+            (void)snprintf(out_rec_buf, rec_len, "#%u", (unsigned)frames);
         }
     }
 }
@@ -229,7 +225,7 @@ static lv_obj_t *create_header_chip_btn(lv_obj_t *parent,
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_height(btn, 22);
-    lv_obj_set_style_pad_hor(btn, 4, 0);
+    lv_obj_set_style_pad_hor(btn, 2, 0);
     lv_obj_set_style_pad_ver(btn, 1, 0);
     lv_obj_set_style_radius(btn, 4, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(bg_hex), 0);
@@ -258,9 +254,9 @@ lv_obj_t *ui_header_create_widgets(lv_obj_t *parent_screen)
     lv_obj_set_style_bg_color(s_header_bar, lv_color_hex(0x141B24), 0);
     lv_obj_set_style_border_width(s_header_bar, 0, 0);
     lv_obj_set_style_radius(s_header_bar, 0, 0);
-    lv_obj_set_style_pad_hor(s_header_bar, 3, 0);
+    lv_obj_set_style_pad_hor(s_header_bar, 2, 0);
     lv_obj_set_style_pad_ver(s_header_bar, 2, 0);
-    lv_obj_set_style_pad_column(s_header_bar, 3, 0);
+    lv_obj_set_style_pad_column(s_header_bar, 2, 0);
     lv_obj_clear_flag(s_header_bar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(s_header_bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_header_bar,
@@ -271,22 +267,24 @@ lv_obj_t *ui_header_create_widgets(lv_obj_t *parent_screen)
     /* Home button */
     s_btn_home = create_header_chip_btn(s_header_bar, LV_SYMBOL_HOME, 0x263238, on_home_clicked, NULL);
 
-    /* Screen / Tool title */
+    /* Screen / Tool title (flex_grow fills remaining space and shrinks when BG pill appears) */
     s_lbl_title = lv_label_create(s_header_bar);
     lv_label_set_text(s_lbl_title, "M5CoreAnalyser");
     lv_label_set_long_mode(s_lbl_title, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(s_lbl_title, 76);
+    lv_obj_set_width(s_lbl_title, 0);
+    lv_obj_set_style_min_width(s_lbl_title, 20, 0);
+    lv_obj_set_flex_grow(s_lbl_title, 1);
     lv_obj_set_style_text_font(s_lbl_title, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_title, lv_color_hex(0x80CBC4), 0);
 
     /* Background generator pill */
     s_btn_bg_pill = create_header_chip_btn(
-        s_header_bar, "BG GEN", 0xE65100, on_bg_pill_clicked, &s_lbl_bg_pill);
+        s_header_bar, "BG:wave", 0xE65100, on_bg_pill_clicked, &s_lbl_bg_pill);
     lv_obj_add_flag(s_btn_bg_pill, LV_OBJ_FLAG_HIDDEN);
 
     /* Speaker monitor toggle */
     s_btn_spk = create_header_chip_btn(
-        s_header_bar, "SPK OFF", 0x37474F, on_spk_clicked, &s_lbl_spk);
+        s_header_bar, "SPK -", 0x37474F, on_spk_clicked, &s_lbl_spk);
 
     /* Recorder toggle button */
     s_btn_rec = create_header_chip_btn(
@@ -302,6 +300,11 @@ lv_obj_t *ui_header_create_widgets(lv_obj_t *parent_screen)
     lv_obj_set_style_text_font(s_lbl_batt, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_lbl_batt, lv_color_hex(0xA5D6A7), 0);
 
+    return s_header_bar;
+}
+
+lv_obj_t *ui_header_get_bar(void)
+{
     return s_header_bar;
 }
 

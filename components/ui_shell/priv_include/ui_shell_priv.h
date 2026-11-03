@@ -27,6 +27,27 @@ lv_obj_t *ui_header_create_widgets(lv_obj_t *parent_screen);
  */
 void ui_header_apply_state(const ui_header_state_t *state);
 
+/**
+ * @brief Return the persistent 28 px LVGL header bar object (unit-test & layout inspection seam).
+ *
+ * @return Header bar `lv_obj_t *` or `NULL`.
+ */
+lv_obj_t *ui_header_get_bar(void);
+
+/**
+ * @brief Return the 320x212 launcher container object (unit-test visibility inspection seam).
+ *
+ * @return Launcher container `lv_obj_t *` or `NULL`.
+ */
+lv_obj_t *ui_shell_get_launcher_container(void);
+
+/**
+ * @brief Return the 2x3 launcher grid object holding tool cards (unit-test card count seam).
+ *
+ * @return Launcher grid `lv_obj_t *` or `NULL`.
+ */
+lv_obj_t *ui_shell_get_launcher_grid(void);
+
 #ifdef __cplusplus
 }
 #endif
