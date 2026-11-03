@@ -639,3 +639,27 @@ TEST_CASE("given axp192 reg 0x94 gpio state and battery adc registers when calcu
     /* Midpoint 3675 mV -> 50% */
     TEST_ASSERT_EQUAL_UINT8(50, bsp_axp192_calc_battery_percent(3675));
 }
+
+TEST_CASE("given adc1 read args when validated then invalid pins and null output are rejected without touching hardware", "[bsp_m5core2][adc]")
+{
+    int raw = -1;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, bsp_adc1_read_raw(GPIO_NUM_36, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, bsp_adc1_read_raw(GPIO_NUM_32, &raw));
+    TEST_ASSERT_EQUAL(-1, raw);
+}
+
+TEST_CASE("given adc1 mock fallback config when queried then mode flag and raw reads match build option", "[bsp_m5core2][adc]")
+{
+#if CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK
+    /* test_app (QEMU) build: raw reads are deterministic mid-scale and clearly flagged as mock. */
+    TEST_ASSERT_TRUE(bsp_adc1_uses_mock_fallback());
+    int raw = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_adc1_read_raw(GPIO_NUM_36, &raw));
+    TEST_ASSERT_EQUAL(2048, raw);
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_adc1_read_raw(GPIO_NUM_35, &raw));
+    TEST_ASSERT_EQUAL(2048, raw);
+#else
+    /* Production build: fallback is compiled out, so every read goes through adc_oneshot_read(). */
+    TEST_ASSERT_FALSE(bsp_adc1_uses_mock_fallback());
+#endif
+}
