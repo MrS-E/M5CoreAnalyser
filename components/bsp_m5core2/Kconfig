@@ -1,0 +1,14 @@
+menu "M5CoreAnalyser BSP (M5Stack Core2) Configuration"
+
+    config BSP_ADC1_QEMU_MIDSCALE_FALLBACK
+        bool "Test-only: return mid-scale (2048) from bsp_adc1_read_raw() instead of hardware ADC reads"
+        default n
+        help
+            The ESP32 QEMU machine does not emulate the SAR ADC (SENS) registers, so
+            adc_oneshot_read() spins forever there. Enable this ONLY in test/QEMU builds
+            (test_app/sdkconfig.defaults). When enabled, bsp_adc1_read_raw() always returns
+            2048 without touching hardware and bsp_adc1_uses_mock_fallback() returns true.
+            Production firmware keeps this disabled so every ADC read uses adc_oneshot_read()
+            and failures are propagated to the caller, never silently replaced with mid-scale.
+
+endmenu

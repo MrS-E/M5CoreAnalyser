@@ -328,11 +328,28 @@ esp_err_t bsp_adc1_init(void);
 /**
  * @brief Read a single raw 12-bit ADC1 sample (`0..4095`) from `GPIO36` or `GPIO35`.
  *
+ * Production builds always call `adc_oneshot_read()` and propagate its error code unchanged;
+ * a failed hardware read is never replaced with a substitute value. The only exception is a
+ * test-only build with `CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK=y` (set in `test_app/sdkconfig.defaults`
+ * for QEMU, where SAR ADC registers are not emulated), which always returns mid-scale `2048`
+ * and `ESP_OK`. Use `bsp_adc1_uses_mock_fallback()` to detect that mode.
+ *
  * @param[in]  pin     `GPIO_NUM_36` (`ADC1_CHANNEL_0`) or `GPIO_NUM_35` (`ADC1_CHANNEL_7`).
  * @param[out] out_raw Pointer to store raw 12-bit reading.
- * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` for unsupported pins.
+ * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` for unsupported pins or `NULL` output,
+ *         or the `adc_oneshot_read()` error code on hardware failure.
  */
 esp_err_t bsp_adc1_read_raw(gpio_num_t pin, int *out_raw);
+
+/**
+ * @brief Report whether `bsp_adc1_read_raw()` is running the test-only mid-scale mock fallback.
+ *
+ * Returns true only when built with `CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK=y` (test_app on QEMU).
+ * Always false in production firmware, where every sample comes from real ADC hardware.
+ *
+ * @return true if raw reads are mock mid-scale values, false if they come from hardware.
+ */
+bool bsp_adc1_uses_mock_fallback(void);
 
 /**
  * @brief Convert a raw 12-bit ADC1 sample (`0..4095`) into calibrated millivolts (`0..3300` mV).

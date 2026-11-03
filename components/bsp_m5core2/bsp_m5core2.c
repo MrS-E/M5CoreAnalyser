@@ -23,8 +23,6 @@ static const char *TAG = "bsp_m5core2";
 
 #define FT6336U_REG_TD_STATUS              (0x02)
 #define FT6336U_I2C_TIMEOUT_MS             (30)
-#define ESP32_SENS_SAR_READ_CTRL_REG_ADDR  (0x3ff48800UL)
-#define ESP32_SENS_SAR_READ_CTRL_DEFAULT   (0x00090802UL)
 
 static bool s_bsp_initialized = false;
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -35,7 +33,6 @@ static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static adc_oneshot_unit_handle_t s_adc1_handle = NULL;
 static adc_cali_handle_t s_adc1_cali_handle = NULL;
 static bool s_adc1_calibrated = false;
-static bool s_adc1_hw_present = false;
 
 static esp_err_t bsp_i2c_init_internal(void)
 {
@@ -319,17 +316,21 @@ esp_err_t bsp_adc1_init(void)
     }
 #endif
 
-    volatile uint32_t *sens_read_ctrl = (volatile uint32_t *)ESP32_SENS_SAR_READ_CTRL_REG_ADDR;
-    uint32_t ctrl_val = *sens_read_ctrl;
-    if (ctrl_val == 0U) {
-        *sens_read_ctrl = ESP32_SENS_SAR_READ_CTRL_DEFAULT;
-        ctrl_val = *sens_read_ctrl;
-    }
-    s_adc1_hw_present = (ctrl_val != 0U);
-
-    ESP_LOGI(TAG, "ADC1 initialized on GPIO36 (CH0) & GPIO35 (CH7), cali=%d, hw=%d",
-             (int)s_adc1_calibrated, (int)s_adc1_hw_present);
+#if CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK
+    ESP_LOGW(TAG, "ADC1 mid-scale mock fallback ACTIVE (test-only build, CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK=y)");
+#endif
+    ESP_LOGI(TAG, "ADC1 initialized on GPIO36 (CH0) & GPIO35 (CH7), cali=%d, mock=%d",
+             (int)s_adc1_calibrated, (int)bsp_adc1_uses_mock_fallback());
     return ESP_OK;
+}
+
+bool bsp_adc1_uses_mock_fallback(void)
+{
+#if CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK
+    return true;
+#else
+    return false;
+#endif
 }
 
 esp_err_t bsp_adc1_read_raw(gpio_num_t pin, int *out_raw)
@@ -348,11 +349,14 @@ esp_err_t bsp_adc1_read_raw(gpio_num_t pin, int *out_raw)
             return err;
         }
     }
-    if (!s_adc1_hw_present) {
-        *out_raw = 2048;
-        return ESP_OK;
-    }
+#if CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK
+    /* Test-only (QEMU): SAR ADC MMIO is not emulated and adc_oneshot_read() would spin forever. */
+    (void)chan;
+    *out_raw = 2048;
+    return ESP_OK;
+#else
     return adc_oneshot_read(s_adc1_handle, chan, out_raw);
+#endif
 }
 
 esp_err_t bsp_adc1_raw_to_mv(gpio_num_t pin, int raw, int *out_mv)

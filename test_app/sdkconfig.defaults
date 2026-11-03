@@ -10,6 +10,9 @@ CONFIG_UNITY_ENABLE_DOUBLE=y
 CONFIG_UNITY_ENABLE_64BIT=y
 CONFIG_UNITY_ENABLE_IDF_TEST_RUNNER=y
 
+# Test-only: ESP32 QEMU does not emulate SAR ADC registers; use deterministic mid-scale mock reads
+CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK=y
+
 # LVGL Configuration for tool_core & ui_shell tests
 CONFIG_LV_CONF_SKIP=y
 CONFIG_LV_COLOR_DEPTH_16=y

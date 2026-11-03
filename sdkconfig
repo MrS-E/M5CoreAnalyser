@@ -3583,6 +3583,13 @@ CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
 
 #
+# M5CoreAnalyser BSP (M5Stack Core2) Configuration
+#
+# default:
+# CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK is not set
+# end of M5CoreAnalyser BSP (M5Stack Core2) Configuration
+
+#
 # M5CoreAnalyser Tool Core Configuration
 #
 # default:
