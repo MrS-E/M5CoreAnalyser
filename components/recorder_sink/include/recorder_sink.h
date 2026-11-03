@@ -36,12 +36,18 @@ typedef enum {
  */
 typedef struct {
     const char *tool_id;     /**< Non-empty source tool identifier (e.g., "scope", "voltmeter") */
-    uint32_t sample_rate_hz; /**< Acquisition sample rate in Hz */
-    uint64_t timestamp_us;   /**< Capture timestamp in microseconds */
+    uint32_t sample_rate_hz; /**< In-frame sample rate in Hz; zero means unknown or non-uniform */
+    uint64_t timestamp_us;   /**< Timestamp in microseconds of the first sample in this frame */
     const void *samples;     /**< Pointer to contiguous sample payload buffer */
     size_t sample_count;     /**< Number of samples in this frame (> 0) */
     size_t bytes_per_sample; /**< Size of each sample in bytes (> 0) */
 } recorder_frame_t;
+
+/**
+ * Recorder frames are individually timestamped contiguous blocks, not an implicit continuous
+ * stream. `sample_rate_hz` describes spacing only within a frame; consumers must use frame
+ * timestamps to account for acquisition pauses or other gaps between blocks.
+ */
 
 /**
  * @brief Thread-safe snapshot of recorder sink state and frame/byte counters.
