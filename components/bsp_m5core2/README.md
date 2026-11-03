@@ -24,7 +24,7 @@
 ### 1. AXP192 PMIC Initialization (`bsp_axp192.c`)
 - Keeps `DCDC1` at `3.35 V` for the ESP32 core (never disabled).
 - Enables `LDO2` at `3.30 V` for the ILI9342C LCD logic and `DCDC3` at `2.80 V` for the LCD backlight.
-- Configures `AXP192 GPIO0` as a `3.3 V` LDO for the M5-Bus rail, `GPIO1` for the green power LED, `GPIO2` (`SPK_EN`) gated **OFF** by default to prevent idle speaker hiss, and `GPIO4` (`TFT_RST`) to hardware-reset the display and touch panel.
+- Configures `AXP192 GPIO0` as a `3.3 V` LDO for the M5-Bus rail, `GPIO1` (`0x94` bit 1 `0x02`, active-low) for the green power LED, `GPIO2` (`0x94` bit 2 `0x04` `SPK_EN`, active-high) gated **OFF** by default to prevent idle speaker hiss, and `GPIO4` (`0x95`/`0x96` bit 1 `TFT_RST`) to hardware-reset the display and touch panel.
 - Enables the 12-bit battery voltage ADC (`0x78`/`0x79`, `1.1 mV/LSB`) and charge status reporting.
 
 ### 2. GPIO Reservation & Conflict Manager (`bsp_pin_manager.c`)
@@ -54,9 +54,11 @@ Header: [`include/bsp_m5core2.h`](include/bsp_m5core2.h)
   - `esp_err_t bsp_axp192_get_battery(uint16_t *out_voltage_mv, uint8_t *out_percent, bool *out_charging)`
   - `uint16_t bsp_axp192_raw12_to_mv(uint8_t reg_hi, uint8_t reg_lo)`
   - `uint8_t bsp_axp192_calc_battery_percent(uint16_t voltage_mv)`
+  - `uint8_t bsp_axp192_calc_gpio_state(uint8_t reg94_prev, bool spk_enable, bool led_on)`
+  - `uint8_t bsp_axp192_get_reg94_state(void)`
   - `esp_err_t bsp_axp192_set_speaker_enable(bool enable)` / `bool bsp_axp192_get_speaker_enable(void)`
   - `esp_err_t bsp_axp192_set_lcd_backlight(uint8_t brightness_percent)`
-  - `esp_err_t bsp_axp192_set_led(bool on)`
+  - `esp_err_t bsp_axp192_set_led(bool on)` / `bool bsp_axp192_get_led_state(void)`
 - **Display, Touch & ADC1**:
   - `esp_err_t bsp_display_init(void)`
   - `esp_lcd_panel_handle_t bsp_display_get_panel(void)`

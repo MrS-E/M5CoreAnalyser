@@ -20,8 +20,8 @@
 | **LDO3** | `0x28[3:0]`, `0x12[3]` | `0 V`, OFF | Coin vibration motor | Kept OFF by default |
 | **EXTEN** | `0x12[6]` | ON | 5 V boost converter for Grove/M5-Bus | Supplies 5 V expansion rail |
 | **AXP GPIO0** | `0x90`, `0x91` | LDO mode (`0x02`), `3.3 V` (`0xF0`) | M5-Bus peripheral VDD | Powers bus logic |
-| **AXP GPIO1** | `0x92`, `0x94[0]` | NMOS Open-Drain (`0x00`) | Green system LED (active-low) | Controlled by `bsp_axp192_set_led()` |
-| **AXP GPIO2** | `0x93`, `0x94[1]` | NMOS Open-Drain (`0x00`) | NS4168 Speaker Amp Enable (`SPK_EN`) | Gated OFF when muted/idle (`bsp_axp192_set_speaker_enable()`) |
+| **AXP GPIO1** | `0x92`, `0x94[1]` | NMOS Open-Drain (`0x00`), bit 1 (`0x02`) | Green system LED (active-low: `0`=ON, `1`=OFF) | Controlled by `bsp_axp192_set_led()` |
+| **AXP GPIO2** | `0x93`, `0x94[2]` | NMOS Open-Drain (`0x00`), bit 2 (`0x04`) | NS4168 Speaker Amp Enable (`SPK_EN`, active-high) | Gated OFF when muted/idle (`bsp_axp192_set_speaker_enable()`) |
 | **AXP GPIO4** | `0x95`, `0x96[1]` | NMOS Open-Drain (`0x84`) | LCD & Touch Hardware Reset (`TFT_RST`) | Pulsed during `bsp_axp192_init()` |
 | **VBAT ADC** | `0x78` (hi), `0x79` (lo) | 12-bit (`1.1 mV / LSB`) | LiPo Battery Voltage Telemetry | Converted via `bsp_axp192_raw12_to_mv()` |
 
