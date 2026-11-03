@@ -3,6 +3,7 @@ idf_component_register(
         "bsp_m5core2.c"
         "bsp_axp192.c"
         "bsp_pin_manager.c"
+        "bsp_spk_passthrough.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
