@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "tool_voltmeter.c"
+        "voltmeter_dsp.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        bsp_m5core2
+        tool_core
+        recorder_sink
+        lvgl
+        nvs_flash
+        esp_timer
+        heap
+        freertos
+        log
+)
