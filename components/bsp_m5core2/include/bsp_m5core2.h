@@ -150,6 +150,43 @@ i2c_master_bus_handle_t bsp_i2c_get_bus(void);
  * AXP192 PMIC Power, Battery & Peripheral Control
  * -------------------------------------------------------------------------- */
 
+/** @name AXP192 GPIO[2:0] Signal Status Register (0x94) Bit Masks
+ *  @{
+ */
+#define BSP_AXP192_REG_GPIO012_STATE   (0x94U)
+#define BSP_AXP192_GPIO1_LED_BIT       (1U << 1) /**< Bit 1 (0x02): GPIO1 Power LED (active-low: 0=ON, 1=OFF) */
+#define BSP_AXP192_GPIO2_SPK_EN_BIT    (1U << 2) /**< Bit 2 (0x04): GPIO2 NS4168 SPK_EN (active-high: 1=ON, 0=OFF) */
+/** @} */
+
+/**
+ * @brief Compute the updated AXP192 register `0x94` (`GPIO[2:0]` state) byte for speaker and LED control.
+ *
+ * Pure register calculation helper matching upstream M5Stack Core2 `AXP192` semantics:
+ * - Preserves bit 0 (`GPIO0` bus LDO state) and upper bits `[7:3]` in `reg94_prev`.
+ * - Sets/clears bit 2 (`0x04`, `BSP_AXP192_GPIO2_SPK_EN_BIT`) for `SPK_EN` (active-high: `true` -> `1`).
+ * - Clears/sets bit 1 (`0x02`, `BSP_AXP192_GPIO1_LED_BIT`) for `SYS_LED` (active-low: `true` -> `0`, `false` -> `1`).
+ *
+ * @param[in] reg94_prev Previous value of AXP192 register `0x94`.
+ * @param[in] spk_enable True to enable NS4168 speaker amplifier (`bit 2 = 1`), false to disable (`bit 2 = 0`).
+ * @param[in] led_on     True to turn green power LED on (`bit 1 = 0`), false to turn off (`bit 1 = 1`).
+ * @return Updated AXP192 register `0x94` byte.
+ */
+uint8_t bsp_axp192_calc_gpio_state(uint8_t reg94_prev, bool spk_enable, bool led_on);
+
+/**
+ * @brief Return the last computed/written AXP192 register `0x94` (`GPIO[2:0]` state) byte.
+ *
+ * @return Shadow register `0x94` value.
+ */
+uint8_t bsp_axp192_get_reg94_state(void);
+
+/**
+ * @brief Query the last commanded state of the AXP192 `GPIO1` green power LED.
+ *
+ * @return True if LED is commanded on (`0x94` bit 1 = 0), false if commanded off (`0x94` bit 1 = 1).
+ */
+bool bsp_axp192_get_led_state(void);
+
 /**
  * @brief Initialize the AXP192 PMIC on the specified I2C master bus.
  *
@@ -554,6 +591,27 @@ esp_err_t bsp_spk_passthrough_push_u8(const uint8_t *dac_samples, size_t count);
  * @return Pointer to internal last-batch PCM buffer.
  */
 const int16_t *bsp_spk_passthrough_get_last_pcm(size_t *out_samples_count);
+
+/**
+ * @brief Backend I2S operations table for speaker passthrough (allows test injection of I2S errors).
+ */
+typedef struct {
+    esp_err_t (*ensure_init)(uint32_t sample_rate_hz); /**< Initialize or reconfigure I2S1 clock and enable channel */
+    esp_err_t (*write_pcm)(const int16_t *pcm,
+                           size_t byte_len,
+                           size_t *out_bytes_written,
+                           uint32_t timeout_ms);       /**< Write 16-bit mono PCM samples to I2S1 DMA */
+    esp_err_t (*disable)(void);                        /**< Disable I2S1 channel when passthrough stops */
+} bsp_spk_i2s_ops_t;
+
+/**
+ * @brief Override or restore the `I2S1` hardware backend used by speaker passthrough.
+ *
+ * Passing `NULL` restores the default `I2S_NUM_1` hardware implementation.
+ *
+ * @param[in] ops Pointer to custom `bsp_spk_i2s_ops_t` table, or `NULL` for default hardware `I2S1`.
+ */
+void bsp_spk_passthrough_set_i2s_ops(const bsp_spk_i2s_ops_t *ops);
 
 #ifdef __cplusplus
 }

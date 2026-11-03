@@ -9,7 +9,7 @@
  * - 0x26: DCDC1 Voltage (MCU 3.35V -> 0x6A; 700mV + N*25mV)
  * - 0x27: DCDC3 Voltage (LCD Backlight 2.80V -> 0x54; 700mV + N*25mV)
  * - 0x28: LDO2/LDO3 Voltage (Upper nibble LDO2=3.3V -> 0xF0; 1800mV + N*100mV)
- * - 0x30: VBUS-IPSOUT Path Setting (0x80 = no VBUS current limit)
+ * - 0x30: VBUS-IPSOUT Path Setting (0x02 = 500mA VBUS current limit enabled)
  * - 0x33: Charge Control 1 (0xC0 = enable 4.2V @ 100mA)
  * - 0x78, 0x79: Battery Voltage ADC 12-bit (1.1 mV / LSB)
  * - 0x82: ADC Enable 1 (0xFF = enable VBAT/IBAT/VBUS ADCs)
@@ -17,7 +17,7 @@
  * - 0x91: GPIO0 LDO Voltage (0xF0 = 3.3V)
  * - 0x92: GPIO1 Mode (0x00 = NMOS open-drain output for green power LED)
  * - 0x93: GPIO2 Mode (0x00 = NMOS open-drain output for NS4168 SPK_EN)
- * - 0x94: GPIO[2:0] Signal Status (Bit0=GPIO1 LED active-low, Bit1=GPIO2 SPK_EN active-high)
+ * - 0x94: GPIO[2:0] Signal Status (Bit1=GPIO1 LED active-low, Bit2=GPIO2 SPK_EN active-high)
  * - 0x95: GPIO[4:3] Function Control (0x84 = GPIO4 NMOS open-drain output for TFT_RST)
  * - 0x96: GPIO[4:3] Signal Status (Bit1=GPIO4 TFT_RST)
  */
@@ -47,7 +47,7 @@ static const char *TAG = "bsp_axp192";
 #define AXP192_REG_GPIO0_LDO_VOLT   (0x91)
 #define AXP192_REG_GPIO1_MODE       (0x92)
 #define AXP192_REG_GPIO2_MODE       (0x93)
-#define AXP192_REG_GPIO012_STATE    (0x94)
+#define AXP192_REG_GPIO012_STATE    (BSP_AXP192_REG_GPIO012_STATE)
 #define AXP192_REG_GPIO34_CTRL      (0x95)
 #define AXP192_REG_GPIO34_STATE     (0x96)
 
@@ -55,7 +55,33 @@ static const char *TAG = "bsp_axp192";
 
 static i2c_master_dev_handle_t s_axp_dev = NULL;
 static volatile bool s_speaker_enabled = false;
+static volatile bool s_led_on = true;
+static volatile uint8_t s_reg94_shadow = 0x00U;
 static uint8_t s_backlight_percent = 85;
+
+uint8_t bsp_axp192_calc_gpio_state(uint8_t reg94_prev, bool spk_enable, bool led_on)
+{
+    const uint8_t mask = (uint8_t)(BSP_AXP192_GPIO1_LED_BIT | BSP_AXP192_GPIO2_SPK_EN_BIT);
+    uint8_t bits = 0U;
+    if (spk_enable) {
+        bits |= (uint8_t)BSP_AXP192_GPIO2_SPK_EN_BIT;
+    }
+    /* GPIO1 green LED is active-low NMOS open-drain: 0 = ON, 1 = OFF */
+    if (!led_on) {
+        bits |= (uint8_t)BSP_AXP192_GPIO1_LED_BIT;
+    }
+    return (uint8_t)((reg94_prev & (uint8_t)(~mask)) | bits);
+}
+
+uint8_t bsp_axp192_get_reg94_state(void)
+{
+    return s_reg94_shadow;
+}
+
+bool bsp_axp192_get_led_state(void)
+{
+    return s_led_on;
+}
 
 static esp_err_t axp192_write_reg(uint8_t reg, uint8_t val)
 {
@@ -129,10 +155,12 @@ esp_err_t bsp_axp192_init(i2c_master_bus_handle_t bus_handle)
     esp_err_t err = i2c_master_probe(bus_handle, BSP_AXP192_I2C_ADDR, AXP192_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "AXP192 PMIC (0x34) not responding on I2C0: %s", esp_err_to_name(err));
+        (void)i2c_master_bus_rm_device(s_axp_dev);
+        s_axp_dev = NULL;
         return err;
     }
 
-    /* 1. VBUS-IPSOUT path: disable VBUS current limit so USB powers board + display cleanly */
+    /* 1. VBUS-IPSOUT path: enable 500 mA VBUS current limit (0x02) matching M5Core2 reference */
     (void)axp192_update_bits(AXP192_REG_VBUS_IPSOUT, 0x07, 0x02);
 
     /* 2. Configure GPIO0 as LDO output at 3.3V (M5-Bus peripheral power) */
@@ -152,9 +180,15 @@ esp_err_t bsp_axp192_init(i2c_master_bus_handle_t bus_handle)
     /* 6. Configure GPIO1 (Power LED, NMOS open-drain) and GPIO2 (Speaker SPK_EN, NMOS open-drain) */
     (void)axp192_write_reg(AXP192_REG_GPIO1_MODE, 0x00);
     (void)axp192_write_reg(AXP192_REG_GPIO2_MODE, 0x00);
-    /* Turn green power LED ON (bit0 = 0) and gate Speaker SPK_EN OFF (bit1 = 0) by default */
+    /* Turn green power LED ON (bit1 = 0, active-low) and gate Speaker SPK_EN OFF (bit2 = 0) by default */
     s_speaker_enabled = false;
-    (void)axp192_update_bits(AXP192_REG_GPIO012_STATE, 0x03, 0x00);
+    s_led_on = true;
+    uint8_t reg94 = 0U;
+    if (axp192_read_reg(AXP192_REG_GPIO012_STATE, &reg94) != ESP_OK) {
+        reg94 = s_reg94_shadow;
+    }
+    s_reg94_shadow = bsp_axp192_calc_gpio_state(reg94, s_speaker_enabled, s_led_on);
+    (void)axp192_write_reg(AXP192_REG_GPIO012_STATE, s_reg94_shadow);
 
     /* 7. Enable battery and VBUS ADCs */
     (void)axp192_write_reg(AXP192_REG_ADC_EN1, 0xFF);
@@ -211,12 +245,24 @@ esp_err_t bsp_axp192_get_battery(uint16_t *out_voltage_mv, uint8_t *out_percent,
 
 esp_err_t bsp_axp192_set_speaker_enable(bool enable)
 {
-    s_speaker_enabled = enable;
     if (s_axp_dev == NULL) {
+        s_speaker_enabled = enable;
+        s_reg94_shadow = bsp_axp192_calc_gpio_state(s_reg94_shadow, s_speaker_enabled, s_led_on);
         return ESP_OK;
     }
-    /* AXP192 Reg 0x94 Bit 1 controls GPIO2 (SPK_EN on M5Stack Core2) */
-    return axp192_update_bits(AXP192_REG_GPIO012_STATE, (1U << 1), enable ? (1U << 1) : 0U);
+    /* AXP192 Reg 0x94 Bit 2 (0x04) controls GPIO2 (SPK_EN on M5Stack Core2) */
+    uint8_t reg94 = 0U;
+    esp_err_t err = axp192_read_reg(AXP192_REG_GPIO012_STATE, &reg94);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t next_reg94 = bsp_axp192_calc_gpio_state(reg94, enable, s_led_on);
+    err = axp192_write_reg(AXP192_REG_GPIO012_STATE, next_reg94);
+    if (err == ESP_OK) {
+        s_speaker_enabled = enable;
+        s_reg94_shadow = next_reg94;
+    }
+    return err;
 }
 
 bool bsp_axp192_get_speaker_enable(void)
@@ -252,10 +298,23 @@ esp_err_t bsp_axp192_set_lcd_backlight(uint8_t brightness_percent)
 esp_err_t bsp_axp192_set_led(bool on)
 {
     if (s_axp_dev == NULL) {
+        s_led_on = on;
+        s_reg94_shadow = bsp_axp192_calc_gpio_state(s_reg94_shadow, s_speaker_enabled, s_led_on);
         return ESP_OK;
     }
-    /* AXP192 GPIO1 is active-low open-drain sink for the green LED */
-    return axp192_update_bits(AXP192_REG_GPIO012_STATE, (1U << 0), on ? 0U : (1U << 0));
+    /* AXP192 Reg 0x94 Bit 1 (0x02) controls GPIO1 (active-low open-drain sink for green LED) */
+    uint8_t reg94 = 0U;
+    esp_err_t err = axp192_read_reg(AXP192_REG_GPIO012_STATE, &reg94);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t next_reg94 = bsp_axp192_calc_gpio_state(reg94, s_speaker_enabled, on);
+    err = axp192_write_reg(AXP192_REG_GPIO012_STATE, next_reg94);
+    if (err == ESP_OK) {
+        s_led_on = on;
+        s_reg94_shadow = next_reg94;
+    }
+    return err;
 }
 
 esp_err_t bsp_axp192_lcd_reset(void)
