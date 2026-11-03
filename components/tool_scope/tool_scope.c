@@ -8,6 +8,7 @@
 #include "tool_scope_priv.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "psram_buffer.h"
@@ -26,10 +28,16 @@
 static const char *TAG = "tool_scope";
 
 #define SCOPE_WORKER_PERIOD_MS      (25)
+#define SCOPE_WORKER_STOP_WAIT_MS   (2000)
+#define SCOPE_WORKER_STOP_RETRIES   (5)
 #define SCOPE_SPK_CHUNK_SAMPLES     (256)
 #define SCOPE_TRIG_STEP_MV          (150U)
 
 static portMUX_TYPE s_scope_lock = portMUX_INITIALIZER_UNLOCKED;
+static StaticSemaphore_t s_step_mutex_buf;
+static SemaphoreHandle_t s_step_mutex = NULL;
+static atomic_int s_step_mutex_state = 0;
+
 static gpio_num_t s_selected_pin = BSP_PIN_ANALOG_IN_DEFAULT;
 static scope_timebase_t s_timebase = SCOPE_TB_1MS_DIV;
 static scope_vscale_t s_vscale = SCOPE_VSCALE_1000MV_DIV;
@@ -37,15 +45,32 @@ static scope_trig_mode_t s_trig_mode = SCOPE_TRIG_AUTO;
 static uint16_t s_trig_level_mv = SCOPE_DEFAULT_TRIG_MV;
 static bool s_running = true;
 static bool s_tool_active = false;
+static volatile bool s_stop_requested = false;
+static volatile bool s_step_preempt = false;
+static volatile uint32_t s_capture_seq = 0;
 
 static scope_frame_t s_latest_frame = {0};
 static psram_double_buf_t s_frame_dbuf = {0};
 static uint16_t *s_raw_ring_buf = NULL;
 static uint16_t *s_mv_ring_buf = NULL;
+static uint16_t s_spk_chunk_buf[SCOPE_SPK_CHUNK_SAMPLES];
 static tool_worker_t *s_worker = NULL;
 
 static scope_sample_source_fn_t s_custom_source_fn = NULL;
 static void *s_custom_source_ctx = NULL;
+
+static void ensure_scope_step_mutex(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&s_step_mutex_state, &expected, 1)) {
+        s_step_mutex = xSemaphoreCreateMutexStatic(&s_step_mutex_buf);
+        atomic_store(&s_step_mutex_state, 2);
+    } else {
+        while (atomic_load(&s_step_mutex_state) != 2) {
+            taskYIELD();
+        }
+    }
+}
 
 /* LVGL 9 UI Widgets (Core 0) */
 static lv_obj_t *s_lbl_top_status = NULL;
@@ -91,6 +116,7 @@ esp_err_t tool_scope_set_pin(gpio_num_t pin)
 
     portENTER_CRITICAL(&s_scope_lock);
     s_selected_pin = pin;
+    s_capture_seq++;
     portEXIT_CRITICAL(&s_scope_lock);
     return ESP_OK;
 }
@@ -109,7 +135,10 @@ esp_err_t tool_scope_set_timebase(scope_timebase_t tb)
         return ESP_ERR_INVALID_ARG;
     }
     portENTER_CRITICAL(&s_scope_lock);
-    s_timebase = tb;
+    if (s_timebase != tb) {
+        s_timebase = tb;
+        s_capture_seq++;
+    }
     portEXIT_CRITICAL(&s_scope_lock);
     return ESP_OK;
 }
@@ -182,7 +211,10 @@ uint16_t tool_scope_get_trig_level_mv(void)
 esp_err_t tool_scope_set_running(bool running)
 {
     portENTER_CRITICAL(&s_scope_lock);
-    s_running = running;
+    if (s_running != running) {
+        s_running = running;
+        s_capture_seq++;
+    }
     portEXIT_CRITICAL(&s_scope_lock);
     return ESP_OK;
 }
@@ -211,6 +243,7 @@ void tool_scope_set_sample_source(scope_sample_source_fn_t fn, void *user_ctx)
     portENTER_CRITICAL(&s_scope_lock);
     s_custom_source_fn = fn;
     s_custom_source_ctx = user_ctx;
+    s_capture_seq++;
     portEXIT_CRITICAL(&s_scope_lock);
 }
 
@@ -233,11 +266,32 @@ static void get_capture_params(scope_timebase_t tb,
     *out_decim_step = 1U;
 }
 
-static void wait_until_us(int64_t deadline_us)
+static bool should_abort_capture(uint32_t start_seq, bool is_bg_worker)
+{
+    portENTER_CRITICAL(&s_scope_lock);
+    bool abort = s_stop_requested || !s_running || (s_capture_seq != start_seq) ||
+                 (is_bg_worker && s_step_preempt);
+    tool_worker_t *worker = s_worker;
+    portEXIT_CRITICAL(&s_scope_lock);
+
+    if (worker != NULL && tool_worker_stop_requested(worker)) {
+        return true;
+    }
+    return abort;
+}
+
+static bool wait_until_us(int64_t deadline_us, uint32_t start_seq, bool is_bg_worker)
 {
     int64_t remaining_us = deadline_us - esp_timer_get_time();
-    while (remaining_us >= 1000) {
-        TickType_t sleep_ticks = pdMS_TO_TICKS((uint32_t)(remaining_us / 1000));
+    while (remaining_us >= 1500) {
+        if (should_abort_capture(start_seq, is_bg_worker)) {
+            return false;
+        }
+        uint32_t delay_ms = (uint32_t)((remaining_us - 500) / 1000);
+        if (delay_ms > 5U) {
+            delay_ms = 5U;
+        }
+        TickType_t sleep_ticks = pdMS_TO_TICKS(delay_ms);
         if (sleep_ticks == 0) {
             sleep_ticks = 1;
         }
@@ -245,9 +299,18 @@ static void wait_until_us(int64_t deadline_us)
         remaining_us = deadline_us - esp_timer_get_time();
     }
 
-    if (remaining_us > 0) {
-        esp_rom_delay_us((uint32_t)remaining_us);
+    while (remaining_us > 0) {
+        if (should_abort_capture(start_seq, is_bg_worker)) {
+            return false;
+        }
+        if (remaining_us > 60) {
+            esp_rom_delay_us(50U);
+        } else if (remaining_us > 4) {
+            esp_rom_delay_us((uint32_t)(remaining_us - 2));
+        }
+        remaining_us = deadline_us - esp_timer_get_time();
     }
+    return !should_abort_capture(start_seq, is_bg_worker);
 }
 
 static int64_t sample_deadline_us(int64_t first_sample_us,
@@ -260,13 +323,18 @@ static int64_t sample_deadline_us(int64_t first_sample_us,
 
 static esp_err_t capture_adc_buffer(gpio_num_t pin,
                                     scope_timebase_t tb,
+                                    uint32_t start_seq,
+                                    bool is_bg_worker,
                                     uint16_t *out_raw,
                                     uint16_t *out_mv,
                                     size_t *out_count,
                                     uint32_t *out_sample_rate_hz,
                                     uint32_t *out_decim_step,
-                                    uint64_t *out_timestamp_us)
+                                    uint64_t *out_timestamp_us,
+                                    bool *out_aborted)
 {
+    *out_aborted = false;
+
     scope_sample_source_fn_t custom_fn = NULL;
     void *custom_ctx = NULL;
     portENTER_CRITICAL(&s_scope_lock);
@@ -292,8 +360,17 @@ static esp_err_t capture_adc_buffer(gpio_num_t pin,
     int64_t first_sample_us = 0;
     int64_t last_sample_us = 0;
     for (size_t i = 0; i < cap_count; ++i) {
-        if (i > 0U && interval_ns >= 1000000U) {
-            wait_until_us(sample_deadline_us(first_sample_us, i, interval_ns));
+        if (should_abort_capture(start_seq, is_bg_worker)) {
+            *out_aborted = true;
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (i > 0U && interval_ns > 0U) {
+            if (!wait_until_us(sample_deadline_us(first_sample_us, i, interval_ns),
+                               start_seq,
+                               is_bg_worker)) {
+                *out_aborted = true;
+                return ESP_ERR_INVALID_STATE;
+            }
         }
 
         int raw = 0;
@@ -336,9 +413,8 @@ static esp_err_t capture_adc_buffer(gpio_num_t pin,
     return ESP_OK;
 }
 
-static esp_err_t scope_worker_step(void *ctx)
+static esp_err_t scope_worker_step_locked(bool is_bg_worker)
 {
-    (void)ctx;
     if (s_raw_ring_buf == NULL || s_mv_ring_buf == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -346,13 +422,12 @@ static esp_err_t scope_worker_step(void *ctx)
     portENTER_CRITICAL(&s_scope_lock);
     gpio_num_t pin = s_selected_pin;
     scope_timebase_t tb = s_timebase;
-    scope_vscale_t vs = s_vscale;
-    scope_trig_mode_t tmode = s_trig_mode;
-    uint16_t tlvl = s_trig_level_mv;
     bool running = s_running;
+    bool stop_req = s_stop_requested;
+    uint32_t start_seq = s_capture_seq;
     portEXIT_CRITICAL(&s_scope_lock);
 
-    if (!running) {
+    if (stop_req || !running) {
         return ESP_OK;
     }
 
@@ -360,15 +435,41 @@ static esp_err_t scope_worker_step(void *ctx)
     uint32_t fs_hz = 0;
     uint32_t decim_step = 1;
     uint64_t capture_timestamp_us = 0;
-    esp_err_t err = capture_adc_buffer(
-        pin, tb, s_raw_ring_buf, s_mv_ring_buf, &captured, &fs_hz, &decim_step, &capture_timestamp_us);
+    bool aborted = false;
+    esp_err_t err = capture_adc_buffer(pin,
+                                       tb,
+                                       start_seq,
+                                       is_bg_worker,
+                                       s_raw_ring_buf,
+                                       s_mv_ring_buf,
+                                       &captured,
+                                       &fs_hz,
+                                       &decim_step,
+                                       &capture_timestamp_us,
+                                       &aborted);
+    if (aborted) {
+        return ESP_OK;
+    }
     if (err != ESP_OK || captured < 2U) {
         return err;
     }
 
+    portENTER_CRITICAL(&s_scope_lock);
+    scope_vscale_t vs = s_vscale;
+    scope_trig_mode_t tmode = s_trig_mode;
+    uint16_t tlvl = s_trig_level_mv;
+    portEXIT_CRITICAL(&s_scope_lock);
+
     if (bsp_spk_passthrough_is_enabled()) {
-        size_t spk_cnt = (captured > SCOPE_SPK_CHUNK_SAMPLES) ? SCOPE_SPK_CHUNK_SAMPLES : captured;
-        (void)bsp_spk_passthrough_push_adc12(s_raw_ring_buf, spk_cnt);
+        uint32_t spk_rate_hz = bsp_spk_passthrough_get_sample_rate();
+        if (spk_rate_hz == 0U) {
+            spk_rate_hz = BSP_SPK_DEFAULT_RATE_HZ;
+        }
+        size_t spk_cnt = scope_dsp_resample_for_speaker(
+            s_raw_ring_buf, captured, fs_hz, spk_rate_hz, s_spk_chunk_buf, SCOPE_SPK_CHUNK_SAMPLES);
+        if (spk_cnt > 0U) {
+            (void)bsp_spk_passthrough_push_adc12(s_spk_chunk_buf, spk_cnt);
+        }
     }
 
     if (recorder_sink_is_recording()) {
@@ -432,9 +533,34 @@ static esp_err_t scope_worker_step(void *ctx)
     return ESP_OK;
 }
 
+static esp_err_t scope_worker_step(void *ctx)
+{
+    (void)ctx;
+    ensure_scope_step_mutex();
+    if (xSemaphoreTake(s_step_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return ESP_OK;
+    }
+    esp_err_t err = scope_worker_step_locked(true);
+    (void)xSemaphoreGive(s_step_mutex);
+    return err;
+}
+
 esp_err_t tool_scope_run_single_step(void)
 {
-    return scope_worker_step(NULL);
+    ensure_scope_step_mutex();
+    portENTER_CRITICAL(&s_scope_lock);
+    s_step_preempt = true;
+    portEXIT_CRITICAL(&s_scope_lock);
+
+    (void)xSemaphoreTake(s_step_mutex, portMAX_DELAY);
+
+    portENTER_CRITICAL(&s_scope_lock);
+    s_step_preempt = false;
+    portEXIT_CRITICAL(&s_scope_lock);
+
+    esp_err_t err = scope_worker_step_locked(false);
+    (void)xSemaphoreGive(s_step_mutex);
+    return err;
 }
 
 /* --------------------------------------------------------------------------
@@ -772,18 +898,28 @@ static esp_err_t scope_on_start(lv_obj_t *parent_cont, void *ctx)
         return ESP_ERR_NO_MEM;
     }
 
+    ensure_scope_step_mutex();
+
     portENTER_CRITICAL(&s_scope_lock);
     s_running = true;
+    s_stop_requested = false;
+    s_step_preempt = false;
+    s_capture_seq++;
     memset(&s_latest_frame, 0, sizeof(s_latest_frame));
     s_tool_active = true;
+    scope_sample_source_fn_t custom_fn = s_custom_source_fn;
+    scope_timebase_t start_tb = s_timebase;
     portEXIT_CRITICAL(&s_scope_lock);
 
     if (parent_cont != NULL) {
         build_scope_ui(parent_cont);
     }
 
-    /* Run an immediate initial capture step so a frame is ready before first UI refresh */
-    (void)scope_worker_step(NULL);
+    /* Run an immediate initial capture step for fast timebases or injected sources
+     * so a frame is ready before first UI refresh without blocking on slow sweeps. */
+    if (custom_fn != NULL || start_tb <= SCOPE_TB_2MS_DIV) {
+        (void)tool_scope_run_single_step();
+    }
 
     tool_worker_config_t wcfg = {
         .name = "scope_c1",
@@ -792,7 +928,7 @@ static esp_err_t scope_on_start(lv_obj_t *parent_cont, void *ctx)
         .core_id = TOOL_WORKER_DEFAULT_CORE,
         .period_ms = SCOPE_WORKER_PERIOD_MS,
         .step_fn = scope_worker_step,
-        .user_ctx = NULL,
+        .user_ctx = (void *)1,
     };
     err = tool_worker_start(&s_worker, &wcfg);
     if (err != ESP_OK) {
@@ -813,10 +949,28 @@ static esp_err_t scope_on_stop(bool keep_background, void *ctx)
     (void)keep_background;
     (void)ctx;
 
-    if (s_worker != NULL) {
-        (void)tool_worker_stop(s_worker, 500);
+    portENTER_CRITICAL(&s_scope_lock);
+    s_stop_requested = true;
+    s_capture_seq++;
+    tool_worker_t *worker = s_worker;
+    portEXIT_CRITICAL(&s_scope_lock);
+
+    if (worker != NULL) {
+        esp_err_t stop_err = ESP_ERR_TIMEOUT;
+        for (int attempt = 0; attempt < SCOPE_WORKER_STOP_RETRIES && stop_err == ESP_ERR_TIMEOUT; ++attempt) {
+            stop_err = tool_worker_stop(worker, SCOPE_WORKER_STOP_WAIT_MS);
+        }
+        if (stop_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to stop scope worker cleanly: %s", esp_err_to_name(stop_err));
+            return stop_err;
+        }
+        portENTER_CRITICAL(&s_scope_lock);
         s_worker = NULL;
+        portEXIT_CRITICAL(&s_scope_lock);
     }
+
+    ensure_scope_step_mutex();
+    (void)xSemaphoreTake(s_step_mutex, portMAX_DELAY);
 
     s_lbl_top_status = NULL;
     s_lbl_trig_badge = NULL;
@@ -837,6 +991,8 @@ static esp_err_t scope_on_stop(bool keep_background, void *ctx)
     gpio_num_t pin = s_selected_pin;
     s_tool_active = false;
     portEXIT_CRITICAL(&s_scope_lock);
+
+    (void)xSemaphoreGive(s_step_mutex);
 
     (void)bsp_pin_release(pin, SCOPE_TOOL_ID);
     return ESP_OK;

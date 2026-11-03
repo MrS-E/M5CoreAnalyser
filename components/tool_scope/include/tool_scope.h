@@ -34,6 +34,7 @@ extern "C" {
 #define SCOPE_DEFAULT_TRIG_MV          (1650U)
 #define SCOPE_DEFAULT_HYST_MV          (40U)
 #define SCOPE_MIN_FREQ_VPP_MV          (60.0f)
+#define SCOPE_SPK_MIN_CAPTURE_RATE_HZ  (4000U)  /**< Minimum capture rate for speaker passthrough; slower sweeps mute */
 
 #if CONFIG_SPIRAM
 #define SCOPE_CAPTURE_BUF_SAMPLES      (16384U) /**< 16K-sample PSRAM capture buffer */
@@ -253,6 +254,28 @@ esp_err_t scope_dsp_compute_metrics(const uint16_t *samples_mv,
                                     size_t count,
                                     uint32_t sample_rate_hz,
                                     scope_metrics_t *out_metrics);
+
+/**
+ * @brief Resample a captured 12-bit ADC buffer from `in_rate_hz` to `target_rate_hz` for speaker monitoring.
+ *
+ * When `in_rate_hz < SCOPE_SPK_MIN_CAPTURE_RATE_HZ` (slow sweep timebases such as `10..100 ms/div`),
+ * returns `0` samples so slow acquisitions are muted rather than played back as pitch-shifted bursts.
+ * When `in_rate_hz >= SCOPE_SPK_MIN_CAPTURE_RATE_HZ`, linearly interpolates `in_raw` to `target_rate_hz`.
+ *
+ * @param[in]  in_raw         Input 12-bit ADC sample array.
+ * @param[in]  in_count       Number of input samples (`>= 2`).
+ * @param[in]  in_rate_hz     Measured capture sample rate in Hz.
+ * @param[in]  target_rate_hz Speaker output sample rate in Hz (e.g. `BSP_SPK_DEFAULT_RATE_HZ`).
+ * @param[out] out_raw        Output resampled 12-bit ADC buffer.
+ * @param[in]  max_out        Maximum capacity of `out_raw`.
+ * @return Number of resampled output samples written to `out_raw` (`0` if muted or invalid).
+ */
+size_t scope_dsp_resample_for_speaker(const uint16_t *in_raw,
+                                      size_t in_count,
+                                      uint32_t in_rate_hz,
+                                      uint32_t target_rate_hz,
+                                      uint16_t *out_raw,
+                                      size_t max_out);
 
 /* --------------------------------------------------------------------------
  * Oscilloscope Runtime Configuration & Control API (tool_scope.c)

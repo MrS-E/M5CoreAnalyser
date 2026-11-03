@@ -356,3 +356,49 @@ esp_err_t scope_dsp_compute_metrics(const uint16_t *samples_mv,
 
     return ESP_OK;
 }
+
+size_t scope_dsp_resample_for_speaker(const uint16_t *in_raw,
+                                      size_t in_count,
+                                      uint32_t in_rate_hz,
+                                      uint32_t target_rate_hz,
+                                      uint16_t *out_raw,
+                                      size_t max_out)
+{
+    if (in_raw == NULL || out_raw == NULL || in_count < 2U || max_out == 0U ||
+        in_rate_hz < SCOPE_SPK_MIN_CAPTURE_RATE_HZ || target_rate_hz == 0U) {
+        return 0U;
+    }
+
+    uint64_t span_out = ((uint64_t)(in_count - 1U) * (uint64_t)target_rate_hz) /
+                        (uint64_t)in_rate_hz + 1ULL;
+    size_t out_count = (span_out > (uint64_t)max_out) ? max_out : (size_t)span_out;
+    if (out_count == 0U) {
+        return 0U;
+    }
+
+    if (in_rate_hz == target_rate_hz) {
+        size_t copy_n = (out_count < in_count) ? out_count : in_count;
+        for (size_t k = 0; k < copy_n; ++k) {
+            out_raw[k] = (in_raw[k] > 4095U) ? 4095U : in_raw[k];
+        }
+        return copy_n;
+    }
+
+    for (size_t k = 0; k < out_count; ++k) {
+        uint64_t pos_fp = (((uint64_t)k * (uint64_t)in_rate_hz) << 16) /
+                          (uint64_t)target_rate_hz;
+        size_t idx = (size_t)(pos_fp >> 16);
+        uint32_t frac = (uint32_t)(pos_fp & 0xFFFFU);
+        if (idx + 1U < in_count) {
+            uint32_t s0 = (in_raw[idx] > 4095U) ? 4095U : in_raw[idx];
+            uint32_t s1 = (in_raw[idx + 1U] > 4095U) ? 4095U : in_raw[idx + 1U];
+            uint32_t interp = (s0 * (65536U - frac) + s1 * frac + 32768U) >> 16;
+            out_raw[k] = (uint16_t)((interp > 4095U) ? 4095U : interp);
+        } else {
+            uint16_t last = in_raw[in_count - 1U];
+            out_raw[k] = (last > 4095U) ? 4095U : last;
+        }
+    }
+
+    return out_count;
+}
