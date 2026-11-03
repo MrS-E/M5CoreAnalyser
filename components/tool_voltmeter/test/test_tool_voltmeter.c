@@ -56,16 +56,19 @@ static const bsp_spk_i2s_ops_t s_mock_volt_i2s_ops = {
 typedef struct {
     float dc_mv;
     float amp_mv;
+    uint32_t sample_rate_hz;
 } synth_sine_ctx_t;
 
 static esp_err_t synth_sine_source_cb(gpio_num_t pin,
                                       uint16_t *out_raw,
                                       float *out_uncal_mv,
                                       size_t count,
+                                      uint32_t *out_sample_rate_hz,
                                       void *user_ctx)
 {
     (void)pin;
     const synth_sine_ctx_t *s = (const synth_sine_ctx_t *)user_ctx;
+    *out_sample_rate_hz = s->sample_rate_hz;
     for (size_t i = 0; i < count; ++i) {
         double phase = (2.0 * M_PI * (double)i) / (double)count;
         float mv = s->dc_mv + s->amp_mv * (float)sin(phase);
@@ -228,7 +231,11 @@ TEST_CASE("given registered tool_voltmeter when started switched pins and steppe
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_reset_cal(BSP_PIN_ANALOG_IN_DEFAULT));
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_set_pin(BSP_PIN_ANALOG_IN_DEFAULT));
 
-    synth_sine_ctx_t synth = {.dc_mv = 1500.0f, .amp_mv = 500.0f};
+    synth_sine_ctx_t synth = {
+        .dc_mv = 1500.0f,
+        .amp_mv = 500.0f,
+        .sample_rate_hz = VOLTMETER_DEFAULT_SAMPLE_RATE_HZ,
+    };
     tool_voltmeter_set_sample_source(synth_sine_source_cb, &synth);
 
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_register());
@@ -256,6 +263,10 @@ TEST_CASE("given registered tool_voltmeter when started switched pins and steppe
     TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1U, rstats.frames_pushed);
     TEST_ASSERT_EQUAL_STRING(VOLTMETER_TOOL_ID, rstats.last_tool_id);
+    TEST_ASSERT_EQUAL_UINT32(16000U, rstats.last_sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(VOLTMETER_DEFAULT_BATCH_SAMPLES, rstats.last_sample_count);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, (uint32_t)rstats.last_timestamp_us);
+    uint64_t first_batch_timestamp_us = rstats.last_timestamp_us;
 
     /* Switch pin to GPIO35 while running */
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_set_pin(BSP_PIN_ANALOG_IN_ALT));
@@ -269,9 +280,14 @@ TEST_CASE("given registered tool_voltmeter when started switched pins and steppe
     TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_release(BSP_PIN_ANALOG_IN_DEFAULT, "other_tool"));
 
     /* Hold mode freezes displayed metrics when input changes */
+    synth.sample_rate_hz = 8000U;
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_set_hold(true));
     synth.dc_mv = 2800.0f;
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(8000U, rstats.last_sample_rate_hz);
+    TEST_ASSERT_GREATER_THAN_UINT32((uint32_t)first_batch_timestamp_us,
+                                    (uint32_t)rstats.last_timestamp_us);
     TEST_ASSERT_EQUAL(ESP_OK, tool_voltmeter_get_latest_metrics(&metrics));
     TEST_ASSERT_FLOAT_WITHIN(10.0f, 1500.0f, metrics.vdc_mv);
 
