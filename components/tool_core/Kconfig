@@ -1,0 +1,11 @@
+menu "M5CoreAnalyser Tool Core Configuration"
+
+    config ANALYSER_RUN_SELFTEST_ON_BOOT
+        bool "Run registered tool_core self-tests automatically during tool_core_init()"
+        default n
+        help
+            When enabled, tool_core_init() executes tool_core_run_selftests() at startup
+            and logs pass/fail results before launching the UI shell. Disabled by default
+            so normal boot is never delayed or disrupted.
+
+endmenu

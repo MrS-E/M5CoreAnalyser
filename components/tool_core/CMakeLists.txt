@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "tool_registry.c"
+        "psram_buffer.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        bsp_m5core2
+        recorder_sink
+        lvgl
+        esp_psram
+        heap
+        freertos
+        log
+)
