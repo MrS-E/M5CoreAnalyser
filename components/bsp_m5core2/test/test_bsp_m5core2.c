@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "bsp_m5core2.h"
+#include "../priv_include/bsp_m5core2_priv.h"
 #include "unity.h"
 
 #ifndef M_PI
@@ -39,10 +40,15 @@ TEST_CASE("given protected internal pins when bsp_pin_claim called then returns 
         GPIO_NUM_34,          /* Internal PDM Mic */
     };
 
+    char owner_buf[BSP_PIN_OWNER_MAX_LEN];
+
     for (size_t i = 0; i < sizeof(protected_pins) / sizeof(protected_pins[0]); ++i) {
         gpio_num_t pin = protected_pins[i];
         TEST_ASSERT_TRUE(bsp_pin_is_protected(pin));
-        TEST_ASSERT_EQUAL_STRING("system", bsp_pin_get_owner(pin));
+        TEST_ASSERT_TRUE(bsp_pin_is_owned_by(pin, "system"));
+        TEST_ASSERT_FALSE(bsp_pin_is_owned_by(pin, "scope"));
+        TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_get_owner_copy(pin, owner_buf, sizeof(owner_buf)));
+        TEST_ASSERT_EQUAL_STRING("system", owner_buf);
         TEST_ASSERT_EQUAL(ESP_ERR_NOT_ALLOWED, bsp_pin_claim(pin, "scope"));
         TEST_ASSERT_EQUAL(ESP_ERR_NOT_ALLOWED, bsp_pin_release(pin, "scope"));
     }
@@ -65,16 +71,27 @@ TEST_CASE("given safe user expansion pins when claimed and released then ownersh
         BSP_PIN_MBUS_GPIO19,       /* GPIO19 */
     };
 
+    char owner_buf[BSP_PIN_OWNER_MAX_LEN];
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, bsp_pin_get_owner_copy(BSP_PIN_ANALOG_IN_DEFAULT, NULL, sizeof(owner_buf)));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, bsp_pin_get_owner_copy(BSP_PIN_ANALOG_IN_DEFAULT, owner_buf, 1));
+
     for (size_t i = 0; i < sizeof(user_pins) / sizeof(user_pins[0]); ++i) {
         gpio_num_t pin = user_pins[i];
         TEST_ASSERT_FALSE(bsp_pin_is_protected(pin));
-        TEST_ASSERT_NULL(bsp_pin_get_owner(pin));
+        TEST_ASSERT_FALSE(bsp_pin_is_owned_by(pin, "logic"));
+        TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, bsp_pin_get_owner_copy(pin, owner_buf, sizeof(owner_buf)));
+        TEST_ASSERT_EQUAL_STRING("", owner_buf);
+
         TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_claim(pin, "logic"));
-        TEST_ASSERT_EQUAL_STRING("logic", bsp_pin_get_owner(pin));
+        TEST_ASSERT_TRUE(bsp_pin_is_owned_by(pin, "logic"));
+        TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_get_owner_copy(pin, owner_buf, sizeof(owner_buf)));
+        TEST_ASSERT_EQUAL_STRING("logic", owner_buf);
+
         /* Idempotent re-claim by same owner */
         TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_claim(pin, "logic"));
         TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_release(pin, "logic"));
-        TEST_ASSERT_NULL(bsp_pin_get_owner(pin));
+        TEST_ASSERT_FALSE(bsp_pin_is_owned_by(pin, "logic"));
+        TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, bsp_pin_get_owner_copy(pin, owner_buf, sizeof(owner_buf)));
     }
 }
 
@@ -99,9 +116,12 @@ TEST_CASE("given background generator when foreground tool claims pins then non-
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, bsp_pin_claim_ex(BSP_PIN_ANALOG_IN_ALT, "wavegen", true));
 
     /* Bulk release for owner frees all its pins */
+    char owner_buf[BSP_PIN_OWNER_MAX_LEN];
     TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_release_all_for_owner("wavegen"));
-    TEST_ASSERT_NULL(bsp_pin_get_owner(BSP_PIN_PORT_C_TXD2));
-    TEST_ASSERT_EQUAL_STRING("analoggen", bsp_pin_get_owner(BSP_PIN_DAC_OUT_CH1));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, bsp_pin_get_owner_copy(BSP_PIN_PORT_C_TXD2, owner_buf, sizeof(owner_buf)));
+    TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_DAC_OUT_CH1, "analoggen"));
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_get_owner_copy(BSP_PIN_DAC_OUT_CH1, owner_buf, sizeof(owner_buf)));
+    TEST_ASSERT_EQUAL_STRING("analoggen", owner_buf);
 
     bsp_pin_manager_reset();
 }
@@ -235,15 +255,33 @@ TEST_CASE("given 8-bit dac waveform and gain or mute settings when processed by 
     }
 }
 
+#define MOCK_I2S_MAX_CAPTURED_SAMPLES (1024)
+#define MOCK_I2S_MAX_CHUNKS           (8)
+
 typedef struct {
     esp_err_t next_init_err;
     uint32_t init_calls;
     uint32_t last_rate_hz;
     uint32_t write_calls;
+    size_t chunk_sample_counts[MOCK_I2S_MAX_CHUNKS];
+    size_t last_chunk_samples;
+    int16_t last_chunk_pcm[256];
+    size_t captured_samples_total;
+    int16_t captured_pcm[MOCK_I2S_MAX_CAPTURED_SAMPLES];
     uint32_t disable_calls;
 } mock_i2s_ctx_t;
 
 static mock_i2s_ctx_t s_mock_i2s;
+
+static void mock_i2s_reset_writes(void)
+{
+    s_mock_i2s.write_calls = 0;
+    memset(s_mock_i2s.chunk_sample_counts, 0, sizeof(s_mock_i2s.chunk_sample_counts));
+    s_mock_i2s.last_chunk_samples = 0;
+    memset(s_mock_i2s.last_chunk_pcm, 0, sizeof(s_mock_i2s.last_chunk_pcm));
+    s_mock_i2s.captured_samples_total = 0;
+    memset(s_mock_i2s.captured_pcm, 0, sizeof(s_mock_i2s.captured_pcm));
+}
 
 static esp_err_t mock_i2s_ensure_init(uint32_t sample_rate_hz)
 {
@@ -257,9 +295,23 @@ static esp_err_t mock_i2s_write_pcm(const int16_t *pcm,
                                      size_t *out_bytes_written,
                                      uint32_t timeout_ms)
 {
-    (void)pcm;
     (void)timeout_ms;
+    size_t samples = byte_len / sizeof(int16_t);
+    if (s_mock_i2s.write_calls < MOCK_I2S_MAX_CHUNKS) {
+        s_mock_i2s.chunk_sample_counts[s_mock_i2s.write_calls] = samples;
+    }
     s_mock_i2s.write_calls++;
+
+    if (pcm != NULL && samples > 0) {
+        size_t copy_last = (samples <= 256U) ? samples : 256U;
+        memcpy(s_mock_i2s.last_chunk_pcm, pcm, copy_last * sizeof(int16_t));
+        s_mock_i2s.last_chunk_samples = copy_last;
+
+        for (size_t i = 0; i < samples && s_mock_i2s.captured_samples_total < MOCK_I2S_MAX_CAPTURED_SAMPLES; ++i) {
+            s_mock_i2s.captured_pcm[s_mock_i2s.captured_samples_total++] = pcm[i];
+        }
+    }
+
     if (out_bytes_written != NULL) {
         *out_bytes_written = byte_len;
     }
@@ -272,67 +324,173 @@ static esp_err_t mock_i2s_disable(void)
     return ESP_OK;
 }
 
+static const bsp_spk_i2s_ops_t s_mock_i2s_ops = {
+    .ensure_init = mock_i2s_ensure_init,
+    .write_pcm = mock_i2s_write_pcm,
+    .disable = mock_i2s_disable,
+};
+
+typedef struct {
+    uint8_t regs[256];
+    esp_err_t next_read_err;
+    esp_err_t next_write_err;
+    uint32_t read_calls;
+    uint32_t write_calls;
+} mock_axp_ctx_t;
+
+static mock_axp_ctx_t s_mock_axp;
+
+static esp_err_t mock_axp_read_reg(uint8_t reg, uint8_t *out_val)
+{
+    s_mock_axp.read_calls++;
+    if (s_mock_axp.next_read_err != ESP_OK) {
+        return s_mock_axp.next_read_err;
+    }
+    *out_val = s_mock_axp.regs[reg];
+    return ESP_OK;
+}
+
+static esp_err_t mock_axp_write_reg(uint8_t reg, uint8_t val)
+{
+    s_mock_axp.write_calls++;
+    if (s_mock_axp.next_write_err != ESP_OK) {
+        return s_mock_axp.next_write_err;
+    }
+    s_mock_axp.regs[reg] = val;
+    return ESP_OK;
+}
+
+static const bsp_axp192_reg_ops_t s_mock_axp_ops = {
+    .read_reg = mock_axp_read_reg,
+    .write_reg = mock_axp_write_reg,
+};
+
 TEST_CASE("given speaker passthrough pipeline when enabled muted and disabled then amp gate and pcm buffer update properly", "[bsp_m5core2][passthrough]")
 {
-    bsp_spk_passthrough_set_i2s_ops(NULL);
+    bsp_axp192_set_reg_ops(NULL);
+    memset(&s_mock_i2s, 0, sizeof(s_mock_i2s));
+    bsp_spk_passthrough_set_i2s_ops(&s_mock_i2s_ops);
+
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_gain(100));
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_mute(false));
 
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, bsp_spk_passthrough_enable(true, 1000));
+    mock_i2s_reset_writes();
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(true, 16000));
     TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
     TEST_ASSERT_EQUAL_UINT32(16000, bsp_spk_passthrough_get_sample_rate());
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.init_calls);
+    TEST_ASSERT_EQUAL_UINT32(16000, s_mock_i2s.last_rate_hz);
+    /* Verify 256-sample silence frame was preloaded into I2S1 before opening SPK_EN */
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.last_chunk_samples);
+    for (size_t i = 0; i < 256; ++i) {
+        TEST_ASSERT_EQUAL_INT16(0, s_mock_i2s.last_chunk_pcm[i]);
+    }
     TEST_ASSERT_TRUE(bsp_axp192_get_speaker_enable());
     TEST_ASSERT_BITS_HIGH(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
 
-    uint16_t samples[8] = {2048, 2548, 2048, 1548, 2048, 2548, 2048, 1548};
-    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_push_adc12(samples, 8));
+    /* 1. Push 8 ADC samples and verify exact filtered PCM reaches write_pcm and copy_last_pcm */
+    uint16_t samples8[8] = {2048, 2548, 2048, 1548, 2048, 2548, 2048, 1548};
+    int16_t expected8[8] = {0};
+    bsp_spk_dsp_state_t ref_dsp;
+    bsp_spk_dsp_init(&ref_dsp, 100);
+    bsp_spk_dsp_process_adc12(&ref_dsp, samples8, expected8, 8);
 
-    size_t last_count = 0;
-    const int16_t *last_pcm = bsp_spk_passthrough_get_last_pcm(&last_count);
-    TEST_ASSERT_EQUAL_UINT32(8, (uint32_t)last_count);
-    TEST_ASSERT_TRUE(last_pcm[1] > 0);
+    mock_i2s_reset_writes();
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_push_adc12(samples8, 8));
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(8, (uint32_t)s_mock_i2s.last_chunk_samples);
 
-    /* Muting gates off AXP192 SPK_EN (bit 2 of 0x94) and zeroes buffer */
+    int16_t copied_pcm[256] = {0};
+    size_t copied_count = bsp_spk_passthrough_copy_last_pcm(copied_pcm, 256);
+    TEST_ASSERT_EQUAL_UINT32(8, (uint32_t)copied_count);
+    for (size_t i = 0; i < 8; ++i) {
+        TEST_ASSERT_EQUAL_INT16(expected8[i], s_mock_i2s.last_chunk_pcm[i]);
+        TEST_ASSERT_EQUAL_INT16(expected8[i], copied_pcm[i]);
+    }
+
+    /* 2. Push 600 ADC samples (> 256 chunk size) and verify 256 + 256 + 88 chunking and continuous filtering */
+    static uint16_t large_adc[600];
+    static int16_t expected600[600];
+    for (size_t i = 0; i < 600; ++i) {
+        large_adc[i] = (uint16_t)(2048 + ((i % 2 == 0) ? 300 : -300));
+    }
+    bsp_spk_dsp_process_adc12(&ref_dsp, large_adc, expected600, 600);
+
+    mock_i2s_reset_writes();
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_push_adc12(large_adc, 600));
+    TEST_ASSERT_EQUAL_UINT32(3, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.chunk_sample_counts[0]);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.chunk_sample_counts[1]);
+    TEST_ASSERT_EQUAL_UINT32(88, (uint32_t)s_mock_i2s.chunk_sample_counts[2]);
+    TEST_ASSERT_EQUAL_UINT32(600, (uint32_t)s_mock_i2s.captured_samples_total);
+    for (size_t i = 0; i < 600; ++i) {
+        TEST_ASSERT_EQUAL_INT16(expected600[i], s_mock_i2s.captured_pcm[i]);
+    }
+    copied_count = bsp_spk_passthrough_copy_last_pcm(copied_pcm, 256);
+    TEST_ASSERT_EQUAL_UINT32(88, (uint32_t)copied_count);
+    for (size_t i = 0; i < 88; ++i) {
+        TEST_ASSERT_EQUAL_INT16(expected600[512 + i], copied_pcm[i]);
+    }
+
+    /* 3. Muting gates off AXP192 SPK_EN (bit 2 of 0x94) and writes a 256-sample silence frame to I2S1 */
+    mock_i2s_reset_writes();
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_mute(true));
     TEST_ASSERT_TRUE(bsp_spk_passthrough_is_muted());
     TEST_ASSERT_FALSE(bsp_axp192_get_speaker_enable());
     TEST_ASSERT_BITS_LOW(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.last_chunk_samples);
+    for (size_t i = 0; i < 256; ++i) {
+        TEST_ASSERT_EQUAL_INT16(0, s_mock_i2s.last_chunk_pcm[i]);
+    }
 
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_mute(false));
     TEST_ASSERT_TRUE(bsp_axp192_get_speaker_enable());
     TEST_ASSERT_BITS_HIGH(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
 
-    /* Gain 0% also gates off AXP192 SPK_EN */
+    /* 4. Gain 0% also gates off AXP192 SPK_EN and writes a 256-sample silence frame */
+    mock_i2s_reset_writes();
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_gain(0));
     TEST_ASSERT_FALSE(bsp_axp192_get_speaker_enable());
     TEST_ASSERT_BITS_LOW(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.last_chunk_samples);
+    for (size_t i = 0; i < 256; ++i) {
+        TEST_ASSERT_EQUAL_INT16(0, s_mock_i2s.last_chunk_pcm[i]);
+    }
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_gain(100));
     TEST_ASSERT_TRUE(bsp_axp192_get_speaker_enable());
     TEST_ASSERT_BITS_HIGH(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
 
-    /* Disabling passthrough immediately gates off AXP192 SPK_EN and zeroes DMA buffer */
+    /* 5. Disabling passthrough gates off SPK_EN, writes 256-sample silence frame, and disables I2S1 */
+    mock_i2s_reset_writes();
+    uint32_t disable_before = s_mock_i2s.disable_calls;
     TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(false, 0));
     TEST_ASSERT_FALSE(bsp_spk_passthrough_is_enabled());
     TEST_ASSERT_FALSE(bsp_axp192_get_speaker_enable());
     TEST_ASSERT_BITS_LOW(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
-    last_pcm = bsp_spk_passthrough_get_last_pcm(&last_count);
-    for (size_t i = 0; i < last_count; ++i) {
-        TEST_ASSERT_EQUAL_INT16(0, last_pcm[i]);
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.last_chunk_samples);
+    TEST_ASSERT_EQUAL_UINT32(disable_before + 1U, s_mock_i2s.disable_calls);
+
+    copied_count = bsp_spk_passthrough_copy_last_pcm(copied_pcm, 256);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)copied_count);
+    for (size_t i = 0; i < copied_count; ++i) {
+        TEST_ASSERT_EQUAL_INT16(0, s_mock_i2s.last_chunk_pcm[i]);
+        TEST_ASSERT_EQUAL_INT16(0, copied_pcm[i]);
     }
+
+    bsp_spk_passthrough_set_i2s_ops(NULL);
 }
 
 TEST_CASE("given i2s1 init or clock reconfig error when speaker passthrough enabled then error propagates and amp stays off", "[bsp_m5core2][passthrough]")
 {
-    static const bsp_spk_i2s_ops_t mock_ops = {
-        .ensure_init = mock_i2s_ensure_init,
-        .write_pcm = mock_i2s_write_pcm,
-        .disable = mock_i2s_disable,
-    };
-
+    bsp_axp192_set_reg_ops(NULL);
     (void)bsp_spk_passthrough_enable(false, 0);
     memset(&s_mock_i2s, 0, sizeof(s_mock_i2s));
-    bsp_spk_passthrough_set_i2s_ops(&mock_ops);
+    bsp_spk_passthrough_set_i2s_ops(&s_mock_i2s_ops);
 
     /* 1. Initial I2S1 init failure must propagate and keep SPK_EN gated OFF */
     s_mock_i2s.next_init_err = ESP_ERR_NOT_FOUND;
@@ -360,6 +518,70 @@ TEST_CASE("given i2s1 init or clock reconfig error when speaker passthrough enab
     TEST_ASSERT_BITS_LOW(BSP_AXP192_GPIO2_SPK_EN_BIT, bsp_axp192_get_reg94_state());
     TEST_ASSERT_TRUE(s_mock_i2s.disable_calls > prev_disable_calls);
 
+    bsp_spk_passthrough_set_i2s_ops(NULL);
+}
+
+TEST_CASE("given axp192 i2c error when gating speaker amp on or off then error propagates and silence flushes", "[bsp_m5core2][passthrough][axp192]")
+{
+    memset(&s_mock_i2s, 0, sizeof(s_mock_i2s));
+    memset(&s_mock_axp, 0, sizeof(s_mock_axp));
+    /* Seed register 0x94 with GPIO0 bit 0 = 1 (0x01) to verify RMW preservation */
+    s_mock_axp.regs[BSP_AXP192_REG_GPIO012_STATE] = 0x81U;
+
+    bsp_spk_passthrough_set_i2s_ops(&s_mock_i2s_ops);
+    bsp_axp192_set_reg_ops(&s_mock_axp_ops);
+
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_gain(100));
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_mute(false));
+
+    /* 1. AXP192 write failure during enable(true) propagates error and disables I2S1 */
+    s_mock_axp.next_write_err = ESP_ERR_TIMEOUT;
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, bsp_spk_passthrough_enable(true, 16000));
+    TEST_ASSERT_FALSE(bsp_spk_passthrough_is_enabled());
+    TEST_ASSERT_FALSE(bsp_axp192_get_speaker_enable());
+
+    /* 2. Successful enable(true) updates register 0x94 while preserving bits 7 and 0 (0x81 | 0x04 = 0x85) */
+    s_mock_axp.next_write_err = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_led(true));
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(true, 16000));
+    TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
+    TEST_ASSERT_TRUE(bsp_axp192_get_speaker_enable());
+    TEST_ASSERT_EQUAL_HEX8(0x85U, s_mock_axp.regs[BSP_AXP192_REG_GPIO012_STATE]);
+
+    /* 3. AXP192 write failure on set_mute(true) propagates error while still flushing silence to DMA */
+    mock_i2s_reset_writes();
+    s_mock_axp.next_write_err = ESP_FAIL;
+    TEST_ASSERT_EQUAL(ESP_FAIL, bsp_spk_passthrough_set_mute(true));
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.last_chunk_samples);
+
+    s_mock_axp.next_write_err = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_mute(false));
+
+    /* 4. AXP192 write failure on set_gain(0) propagates error while still flushing silence to DMA */
+    mock_i2s_reset_writes();
+    s_mock_axp.next_write_err = ESP_FAIL;
+    TEST_ASSERT_EQUAL(ESP_FAIL, bsp_spk_passthrough_set_gain(0));
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(256, (uint32_t)s_mock_i2s.last_chunk_samples);
+
+    s_mock_axp.next_write_err = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_set_gain(100));
+
+    /* 5. AXP192 write failure on enable(false) propagates error while flushing silence and disabling I2S1 */
+    mock_i2s_reset_writes();
+    uint32_t disable_before = s_mock_i2s.disable_calls;
+    s_mock_axp.next_write_err = ESP_ERR_TIMEOUT;
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, bsp_spk_passthrough_enable(false, 0));
+    TEST_ASSERT_FALSE(bsp_spk_passthrough_is_enabled());
+    TEST_ASSERT_EQUAL_UINT32(1, s_mock_i2s.write_calls);
+    TEST_ASSERT_EQUAL_UINT32(disable_before + 1U, s_mock_i2s.disable_calls);
+
+    /* Clean up and restore default backends */
+    s_mock_axp.next_write_err = ESP_OK;
+    (void)bsp_axp192_set_speaker_enable(false);
+    (void)bsp_axp192_set_led(true);
+    bsp_axp192_set_reg_ops(NULL);
     bsp_spk_passthrough_set_i2s_ops(NULL);
 }
 
