@@ -160,6 +160,22 @@ TEST_CASE("given capture buffer and trigger index when decimated window is extra
     TEST_ASSERT_EQUAL_UINT16(999U, win[SCOPE_CHART_POINTS - 1U]);
 }
 
+TEST_CASE("given each requested timebase when sample scheduling and viewport math are calculated then ten divisions are represented", "[tool_scope][timing]")
+{
+    for (scope_timebase_t tb = SCOPE_TB_100US_DIV; tb < SCOPE_TB_COUNT; ++tb) {
+        uint32_t interval_ns = scope_dsp_target_sample_interval_ns(tb);
+        TEST_ASSERT_GREATER_THAN_UINT32(0U, interval_ns);
+
+        uint32_t target_rate_hz = (uint32_t)((1000000000ULL + interval_ns / 2U) / interval_ns);
+        uint32_t viewport_us = scope_dsp_viewport_us(target_rate_hz, 1U, SCOPE_CHART_POINTS);
+        uint32_t expected_viewport_us = scope_dsp_timebase_us_per_div(tb) * SCOPE_HORIZ_DIVS;
+        TEST_ASSERT_UINT32_WITHIN(expected_viewport_us / 100U, expected_viewport_us, viewport_us);
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(0U, scope_dsp_target_sample_interval_ns((scope_timebase_t)SCOPE_TB_COUNT));
+    TEST_ASSERT_EQUAL_UINT32(0U, scope_dsp_viewport_us(0U, 1U, SCOPE_CHART_POINTS));
+}
+
 TEST_CASE("given PWM sine and 0V 3.3V rail buffers when metrics are computed then Vpp Vavg Vrms Freq and Duty are accurate", "[tool_scope][metrics]")
 {
     /* 1. 1 kHz 25%-duty PWM wave sampled at 32 kHz (period = 32 samples, high = 8 samples) */
@@ -258,11 +274,26 @@ TEST_CASE("given registered tool_scope when started configured and stepped then 
     TEST_ASSERT_FLOAT_WITHIN(5.0f, 2600.0f, frame.metrics.vpp_mv);
     TEST_ASSERT_FLOAT_WITHIN(20.0f, 1000.0f, frame.metrics.freq_hz);
     TEST_ASSERT_FLOAT_WITHIN(2.5f, 50.0f, frame.metrics.duty_pct);
+    TEST_ASSERT_EQUAL_UINT32(20000U, frame.sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(14950U, frame.viewport_us);
 
     recorder_sink_stats_t rstats = {0};
     TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1U, rstats.frames_pushed);
     TEST_ASSERT_EQUAL_STRING(SCOPE_TOOL_ID, rstats.last_tool_id);
+    TEST_ASSERT_EQUAL_UINT32(20000U, rstats.last_sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(450U, rstats.last_sample_count);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, (uint32_t)rstats.last_timestamp_us);
+
+    /* A second injected rate verifies that both displayed span and recorder metadata track timing. */
+    pwm_ctx.sample_rate_hz = 8000U;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_get_latest_frame(&frame));
+    TEST_ASSERT_EQUAL_UINT32(8000U, frame.sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(37375U, frame.viewport_us);
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(8000U, rstats.last_sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(450U, rstats.last_sample_count);
 
     /* Switch input pin to GPIO35 and verify ownership transfer */
     TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_pin(BSP_PIN_ANALOG_IN_ALT));
