@@ -26,6 +26,8 @@ static const char *TAG = "tool_voltmeter";
 
 #define VOLTMETER_NVS_NAMESPACE     "volt_cal"
 #define VOLTMETER_WORKER_PERIOD_MS  (25)
+#define VOLTMETER_WORKER_STOP_MS    (1000)
+#define VOLTMETER_WORKER_RETRIES    (3)
 
 /**
  * @brief Frame payload transferred from Core 1 worker to Core 0 UI via `psram_double_buf_t`.
@@ -42,6 +44,7 @@ static gpio_num_t s_selected_pin = BSP_PIN_ANALOG_IN_DEFAULT;
 static bool s_hold_enabled = false;
 static bool s_reset_requested = false;
 static bool s_tool_active = false;
+static volatile bool s_stop_requested = false;
 static bool s_nvs_ready = false;
 
 static voltmeter_cal_t s_cal_g36 = {.slope = 1.0f, .offset_mv = 0.0f};
@@ -365,10 +368,15 @@ static esp_err_t voltmeter_worker_step(void *ctx)
     portENTER_CRITICAL(&s_volt_lock);
     gpio_num_t pin = s_selected_pin;
     bool hold = s_hold_enabled;
+    bool stop_req = s_stop_requested;
     bool do_reset = s_reset_requested;
     s_reset_requested = false;
     voltmeter_cal_t cal = (pin == BSP_PIN_ANALOG_IN_ALT) ? s_cal_g35 : s_cal_g36;
     portEXIT_CRITICAL(&s_volt_lock);
+
+    if (stop_req) {
+        return ESP_OK;
+    }
 
     if (do_reset && s_avg_filter.window_mv != NULL) {
         voltmeter_dsp_avg_reset(&s_avg_filter);
@@ -760,6 +768,7 @@ static esp_err_t voltmeter_on_start(lv_obj_t *parent_cont, void *ctx)
     portENTER_CRITICAL(&s_volt_lock);
     s_hold_enabled = false;
     s_reset_requested = false;
+    s_stop_requested = false;
     memset(&s_latest_metrics, 0, sizeof(s_latest_metrics));
     s_tool_active = true;
     portEXIT_CRITICAL(&s_volt_lock);
@@ -799,9 +808,23 @@ static esp_err_t voltmeter_on_stop(bool keep_background, void *ctx)
     (void)keep_background;
     (void)ctx;
 
-    if (s_worker != NULL) {
-        (void)tool_worker_stop(s_worker, 500);
+    portENTER_CRITICAL(&s_volt_lock);
+    s_stop_requested = true;
+    tool_worker_t *worker = s_worker;
+    portEXIT_CRITICAL(&s_volt_lock);
+
+    if (worker != NULL) {
+        esp_err_t stop_err = ESP_ERR_TIMEOUT;
+        for (int attempt = 0; attempt < VOLTMETER_WORKER_RETRIES && stop_err == ESP_ERR_TIMEOUT; ++attempt) {
+            stop_err = tool_worker_stop(worker, VOLTMETER_WORKER_STOP_MS);
+        }
+        if (stop_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to stop voltmeter worker cleanly: %s", esp_err_to_name(stop_err));
+            return stop_err;
+        }
+        portENTER_CRITICAL(&s_volt_lock);
         s_worker = NULL;
+        portEXIT_CRITICAL(&s_volt_lock);
     }
 
     s_lbl_pin_info = NULL;
