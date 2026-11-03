@@ -549,8 +549,6 @@ CONFIG_BOOTLOADER_FLASH_XMC_SUPPORT=y
 # end of Serial Flash Configurations
 
 # default:
-# CONFIG_BOOTLOADER_VDDSDIO_BOOST_1_8V is not set
-# default:
 CONFIG_BOOTLOADER_VDDSDIO_BOOST_1_9V=y
 # default:
 # CONFIG_BOOTLOADER_FACTORY_RESET is not set
@@ -646,13 +644,9 @@ CONFIG_ESP_ROM_BOOTLOADER_OFFSET_FLASH=0x1000
 #
 # default:
 # CONFIG_ESPTOOLPY_NO_STUB is not set
-# default:
 # CONFIG_ESPTOOLPY_FLASHMODE_QIO is not set
-# default:
 # CONFIG_ESPTOOLPY_FLASHMODE_QOUT is not set
-# default:
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
-# default:
 # CONFIG_ESPTOOLPY_FLASHMODE_DOUT is not set
 # default:
 CONFIG_ESPTOOLPY_FLASH_SAMPLE_MODE_STR=y
@@ -660,34 +654,22 @@ CONFIG_ESPTOOLPY_FLASH_SAMPLE_MODE_STR=y
 CONFIG_ESPTOOLPY_FLASHMODE="dio"
 # default:
 CONFIG_ESPTOOLPY_FLASHMODE_VAL=3
-# default:
-# CONFIG_ESPTOOLPY_FLASHFREQ_80M is not set
-# default:
-CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
-# default:
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+# CONFIG_ESPTOOLPY_FLASHFREQ_40M is not set
 # CONFIG_ESPTOOLPY_FLASHFREQ_26M is not set
-# default:
 # CONFIG_ESPTOOLPY_FLASHFREQ_20M is not set
 # default:
-CONFIG_ESPTOOLPY_FLASHFREQ="40m"
-# default:
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
 # CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
-# default:
-CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
-# default:
+# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
 # CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
-# default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
-# default:
-# CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
-# default:
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 # CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
-# default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
-# default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
 # default:
-CONFIG_ESPTOOLPY_FLASHSIZE="2MB"
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 # default:
 # CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE is not set
 # default:
@@ -709,20 +691,15 @@ CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
 #
 # Partition Table
 #
-# default:
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
-# default:
-# CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
-# default:
+# CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 # CONFIG_PARTITION_TABLE_TWO_OTA is not set
-# default:
 # CONFIG_PARTITION_TABLE_TWO_OTA_LARGE is not set
-# default:
 # CONFIG_PARTITION_TABLE_CUSTOM is not set
 # default:
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # default:
-CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp_large.csv"
 # default:
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 # default:
@@ -1370,9 +1347,9 @@ CONFIG_ESP32_UNIVERSAL_MAC_ADDRESSES=4
 # Sleep Config
 #
 # default:
-# CONFIG_ESP_SLEEP_POWER_DOWN_FLASH is not set
-# default:
 CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y
+# default:
+CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND=y
 # default:
 # CONFIG_ESP_SLEEP_MSPI_NEED_ALL_IO_PU is not set
 # default:
@@ -1516,6 +1493,9 @@ CONFIG_LIBC_TIME_SYSCALL_USE_RTC_HRT=y
 CONFIG_LIBC_ASSERT_BUFFER_SIZE=200
 # end of LibC
 
+# default:
+CONFIG_STDATOMIC_S32C1I_SPIRAM_WORKAROUND=y
+
 #
 # ESP-MM: Memory Management Configurations
 #
@@ -1601,13 +1581,136 @@ CONFIG_ESP_PHY_ENABLE_VERSION_PRINT=y
 # CONFIG_PM_ENABLE is not set
 # default:
 # CONFIG_PM_SLP_IRAM_OPT is not set
+# default:
+CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED=y
+# default:
+CONFIG_PM_SLP_SPIRAM_HALFSLEEP_EXIT_WAIT_DELAY=150
 # end of Power Management
 
 #
 # ESP PSRAM
 #
+CONFIG_SPIRAM=y
+
+#
+# SPI RAM config
+#
 # default:
-# CONFIG_SPIRAM is not set
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+# CONFIG_SPIRAM_TYPE_ESPPSRAM16 is not set
+# CONFIG_SPIRAM_TYPE_ESPPSRAM32 is not set
+# CONFIG_SPIRAM_TYPE_ESPPSRAM64 is not set
+# CONFIG_SPIRAM_SPEED_40M is not set
+CONFIG_SPIRAM_SPEED_80M=y
+# default:
+CONFIG_SPIRAM_SPEED=80
+# default:
+CONFIG_SPIRAM_BOOT_HW_INIT=y
+CONFIG_SPIRAM_BOOT_INIT=y
+# default:
+CONFIG_SPIRAM_PRE_CONFIGURE_MEMORY_PROTECTION=y
+# default:
+# CONFIG_SPIRAM_IGNORE_NOTFOUND is not set
+# CONFIG_SPIRAM_USE_MEMMAP is not set
+# CONFIG_SPIRAM_USE_CAPS_ALLOC is not set
+CONFIG_SPIRAM_USE_MALLOC=y
+# default:
+CONFIG_SPIRAM_MEMTEST=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# default:
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# default:
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set
+# default:
+# CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY is not set
+# default:
+CONFIG_SPIRAM_CACHE_WORKAROUND=y
+
+#
+# SPIRAM cache workaround debugging
+#
+# default:
+CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_MEMW=y
+# default:
+# CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_DUPLDST is not set
+# default:
+# CONFIG_SPIRAM_CACHE_WORKAROUND_STRATEGY_NOPS is not set
+# end of SPIRAM cache workaround debugging
+
+#
+# SPIRAM workaround libraries placement
+#
+# default:
+CONFIG_SPIRAM_CACHE_LIBJMP_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBMATH_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBNUMPARSER_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBIO_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBTIME_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBCHAR_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBMEM_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBSTR_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBRAND_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBENV_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBFILE_IN_IRAM=y
+# default:
+CONFIG_SPIRAM_CACHE_LIBMISC_IN_IRAM=y
+# end of SPIRAM workaround libraries placement
+
+# default:
+CONFIG_SPIRAM_BANKSWITCH_ENABLE=y
+# default:
+CONFIG_SPIRAM_BANKSWITCH_RESERVE=8
+# default:
+# CONFIG_SPIRAM_OCCUPY_HSPI_HOST is not set
+# default:
+CONFIG_SPIRAM_OCCUPY_VSPI_HOST=y
+# default:
+# CONFIG_SPIRAM_OCCUPY_NO_HOST is not set
+
+#
+# PSRAM clock and cs IO for ESP32-DOWD
+#
+# default:
+CONFIG_D0WD_PSRAM_CLK_IO=17
+# default:
+CONFIG_D0WD_PSRAM_CS_IO=16
+# end of PSRAM clock and cs IO for ESP32-DOWD
+
+#
+# PSRAM clock and cs IO for ESP32-D2WD
+#
+# default:
+CONFIG_D2WD_PSRAM_CLK_IO=9
+# default:
+CONFIG_D2WD_PSRAM_CS_IO=10
+# end of PSRAM clock and cs IO for ESP32-D2WD
+
+#
+# PSRAM clock and cs IO for ESP32-PICO-D4
+#
+# default:
+CONFIG_PICO_PSRAM_CS_IO=10
+# end of PSRAM clock and cs IO for ESP32-PICO-D4
+
+# default:
+# CONFIG_SPIRAM_CUSTOM_SPIWP_SD3_PIN is not set
+# default:
+CONFIG_SPIRAM_SPIWP_SD3_PIN=7
+# default:
+# CONFIG_SPIRAM_2T_MODE is not set
+# end of SPI RAM config
 # end of ESP PSRAM
 
 #
@@ -1655,14 +1758,11 @@ CONFIG_ESP_STDIO_MAX_VFS_ENTRIES=2
 #
 # ESP System Settings
 #
-# default:
 # CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80 is not set
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # default:
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
-# default:
-# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 is not set
-# default:
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
 #
 # Memory
@@ -1703,8 +1803,7 @@ CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=0
 CONFIG_ESP_SYSTEM_EVENT_QUEUE_SIZE=32
 # default:
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=2304
-# default:
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # default:
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
 # default:
@@ -1718,7 +1817,7 @@ CONFIG_ESP_MINIMAL_SHARED_STACK_SIZE=2048
 # default:
 CONFIG_ESP_INT_WDT=y
 # default:
-CONFIG_ESP_INT_WDT_TIMEOUT_MS=300
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=800
 # default:
 CONFIG_ESP_INT_WDT_CHECK_CPU1=y
 # default:
@@ -1745,6 +1844,8 @@ CONFIG_ESP_DEBUG_OCDAWARE=y
 CONFIG_ESP_SYSTEM_CHECK_INT_LEVEL_4=y
 # default:
 # CONFIG_ESP32_DISABLE_BASIC_ROM_CONSOLE is not set
+# default:
+CONFIG_ESP32_ECO3_CACHE_LOCK_FIX=y
 # end of ESP System Settings
 
 #
@@ -2201,6 +2302,8 @@ CONFIG_FATFS_TIMEOUT_MS=10000
 # default:
 CONFIG_FATFS_PER_FILE_CACHE=y
 # default:
+CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
+# default:
 CONFIG_FATFS_ALLOC_PREFER_ALIGNED_WORK_BUFFERS=y
 # default:
 # CONFIG_FATFS_USE_FASTSEEK is not set
@@ -2242,8 +2345,7 @@ CONFIG_FATFS_DONT_TRUST_LAST_ALLOC=0
 # CONFIG_FREERTOS_SMP is not set
 # default:
 # CONFIG_FREERTOS_UNICORE is not set
-# default:
-CONFIG_FREERTOS_HZ=100
+CONFIG_FREERTOS_HZ=1000
 # default:
 # CONFIG_FREERTOS_CHECK_STACKOVERFLOW_NONE is not set
 # default:
@@ -2330,6 +2432,8 @@ CONFIG_FREERTOS_SYSTICK_USES_CCOUNT=y
 #
 # Extra
 #
+# default:
+# CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is not set
 # end of Extra
 
 # default:
@@ -2838,6 +2942,8 @@ CONFIG_MBEDTLS_HAVE_TIME=y
 # default:
 CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y
 # default:
+# CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC is not set
+# default:
 # CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC is not set
 # default:
 # CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC is not set
@@ -3161,6 +3267,8 @@ CONFIG_MBEDTLS_PKCS1_V21=y
 # default:
 # CONFIG_NVS_LEGACY_DUP_KEYS_COMPATIBILITY is not set
 # default:
+# CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM is not set
+# default:
 # CONFIG_NVS_BDL_STACK is not set
 # default:
 # CONFIG_NVS_FLASH_VERIFY_ERASE is not set
@@ -3473,6 +3581,646 @@ CONFIG_WL_SECTOR_SIZE_4096=y
 # default:
 CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
+
+#
+# ESP LCD TOUCH
+#
+# default:
+CONFIG_ESP_LCD_TOUCH_MAX_POINTS=5
+# default:
+CONFIG_ESP_LCD_TOUCH_MAX_BUTTONS=1
+# end of ESP LCD TOUCH
+
+#
+# LVGL configuration
+#
+# CONFIG_LV_CONF_SKIP is not set
+# default:
+# CONFIG_LV_CONF_MINIMAL is not set
+
+#
+# Color Settings
+#
+# CONFIG_LV_COLOR_DEPTH_32 is not set
+# CONFIG_LV_COLOR_DEPTH_24 is not set
+CONFIG_LV_COLOR_DEPTH_16=y
+# CONFIG_LV_COLOR_DEPTH_8 is not set
+# CONFIG_LV_COLOR_DEPTH_1 is not set
+# default:
+CONFIG_LV_COLOR_DEPTH=16
+# end of Color Settings
+
+#
+# Memory Settings
+#
+# default:
+CONFIG_LV_USE_BUILTIN_MALLOC=y
+# default:
+# CONFIG_LV_USE_CLIB_MALLOC is not set
+# default:
+# CONFIG_LV_USE_MICROPYTHON_MALLOC is not set
+# default:
+# CONFIG_LV_USE_RTTHREAD_MALLOC is not set
+# default:
+# CONFIG_LV_USE_CUSTOM_MALLOC is not set
+# default:
+CONFIG_LV_USE_BUILTIN_STRING=y
+# default:
+# CONFIG_LV_USE_CLIB_STRING is not set
+# default:
+# CONFIG_LV_USE_CUSTOM_STRING is not set
+# default:
+CONFIG_LV_USE_BUILTIN_SPRINTF=y
+# default:
+# CONFIG_LV_USE_CLIB_SPRINTF is not set
+# default:
+# CONFIG_LV_USE_CUSTOM_SPRINTF is not set
+CONFIG_LV_MEM_SIZE_KILOBYTES=64
+# default:
+CONFIG_LV_MEM_POOL_EXPAND_SIZE_KILOBYTES=0
+# default:
+CONFIG_LV_MEM_ADR=0x0
+# end of Memory Settings
+
+#
+# HAL Settings
+#
+# default:
+CONFIG_LV_DEF_REFR_PERIOD=33
+# default:
+CONFIG_LV_DPI_DEF=130
+# end of HAL Settings
+
+#
+# Operating System (OS)
+#
+# default:
+CONFIG_LV_OS_NONE=y
+# default:
+# CONFIG_LV_OS_PTHREAD is not set
+# default:
+# CONFIG_LV_OS_FREERTOS is not set
+# default:
+# CONFIG_LV_OS_CMSIS_RTOS2 is not set
+# default:
+# CONFIG_LV_OS_RTTHREAD is not set
+# default:
+# CONFIG_LV_OS_WINDOWS is not set
+# default:
+# CONFIG_LV_OS_MQX is not set
+# default:
+# CONFIG_LV_OS_CUSTOM is not set
+# default:
+CONFIG_LV_USE_OS=0
+# end of Operating System (OS)
+
+#
+# Rendering Configuration
+#
+# default:
+CONFIG_LV_DRAW_BUF_STRIDE_ALIGN=1
+# default:
+CONFIG_LV_DRAW_BUF_ALIGN=4
+# default:
+CONFIG_LV_DRAW_LAYER_SIMPLE_BUF_SIZE=24576
+# default:
+CONFIG_LV_USE_DRAW_SW=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_RGB565=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_RGB565A8=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_RGB888=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_XRGB8888=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_ARGB8888=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_L8=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_AL88=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_A8=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_I1=y
+# default:
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
+# default:
+# CONFIG_LV_USE_DRAW_ARM2D_SYNC is not set
+# default:
+# CONFIG_LV_USE_NATIVE_HELIUM_ASM is not set
+# default:
+CONFIG_LV_DRAW_SW_COMPLEX=y
+# default:
+# CONFIG_LV_USE_DRAW_SW_COMPLEX_GRADIENTS is not set
+# default:
+CONFIG_LV_DRAW_SW_SHADOW_CACHE_SIZE=0
+# default:
+CONFIG_LV_DRAW_SW_CIRCLE_CACHE_SIZE=4
+# default:
+CONFIG_LV_DRAW_SW_ASM_NONE=y
+# default:
+# CONFIG_LV_DRAW_SW_ASM_NEON is not set
+# default:
+# CONFIG_LV_DRAW_SW_ASM_HELIUM is not set
+# default:
+# CONFIG_LV_DRAW_SW_ASM_CUSTOM is not set
+# default:
+CONFIG_LV_USE_DRAW_SW_ASM=0
+# default:
+# CONFIG_LV_USE_DRAW_VGLITE is not set
+# default:
+# CONFIG_LV_USE_PXP is not set
+# default:
+# CONFIG_LV_USE_DRAW_DAVE2D is not set
+# default:
+# CONFIG_LV_USE_DRAW_SDL is not set
+# default:
+# CONFIG_LV_USE_DRAW_VG_LITE is not set
+# default:
+# CONFIG_LV_USE_VECTOR_GRAPHIC is not set
+# end of Rendering Configuration
+
+#
+# Feature Configuration
+#
+
+#
+# Logging
+#
+# default:
+# CONFIG_LV_USE_LOG is not set
+# end of Logging
+
+#
+# Asserts
+#
+# default:
+CONFIG_LV_USE_ASSERT_NULL=y
+# default:
+CONFIG_LV_USE_ASSERT_MALLOC=y
+# default:
+# CONFIG_LV_USE_ASSERT_STYLE is not set
+# default:
+# CONFIG_LV_USE_ASSERT_MEM_INTEGRITY is not set
+# default:
+# CONFIG_LV_USE_ASSERT_OBJ is not set
+# default:
+CONFIG_LV_ASSERT_HANDLER_INCLUDE="assert.h"
+# end of Asserts
+
+#
+# Debug
+#
+# default:
+# CONFIG_LV_USE_REFR_DEBUG is not set
+# default:
+# CONFIG_LV_USE_LAYER_DEBUG is not set
+# default:
+# CONFIG_LV_USE_PARALLEL_DRAW_DEBUG is not set
+# end of Debug
+
+#
+# Others
+#
+# default:
+# CONFIG_LV_ENABLE_GLOBAL_CUSTOM is not set
+# default:
+CONFIG_LV_CACHE_DEF_SIZE=0
+# default:
+CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=0
+# default:
+CONFIG_LV_GRADIENT_MAX_STOPS=2
+# default:
+CONFIG_LV_COLOR_MIX_ROUND_OFS=128
+# default:
+# CONFIG_LV_OBJ_STYLE_CACHE is not set
+# default:
+# CONFIG_LV_USE_OBJ_ID is not set
+# default:
+# CONFIG_LV_USE_OBJ_PROPERTY is not set
+# end of Others
+# end of Feature Configuration
+
+#
+# Compiler Settings
+#
+# default:
+# CONFIG_LV_BIG_ENDIAN_SYSTEM is not set
+# default:
+CONFIG_LV_ATTRIBUTE_MEM_ALIGN_SIZE=1
+# default:
+# CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM is not set
+# default:
+# CONFIG_LV_USE_FLOAT is not set
+# default:
+# CONFIG_LV_USE_MATRIX is not set
+# default:
+# CONFIG_LV_USE_PRIVATE_API is not set
+# end of Compiler Settings
+
+#
+# Font Usage
+#
+
+#
+# Enable built-in fonts
+#
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_8 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_10 is not set
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_18 is not set
+CONFIG_LV_FONT_MONTSERRAT_20=y
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_22 is not set
+CONFIG_LV_FONT_MONTSERRAT_24=y
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_26 is not set
+CONFIG_LV_FONT_MONTSERRAT_28=y
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_30 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_32 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_34 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_36 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_38 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_40 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_42 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_44 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_46 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_48 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_28_COMPRESSED is not set
+# default:
+# CONFIG_LV_FONT_DEJAVU_16_PERSIAN_HEBREW is not set
+# default:
+# CONFIG_LV_FONT_SIMSUN_14_CJK is not set
+# default:
+# CONFIG_LV_FONT_SIMSUN_16_CJK is not set
+# default:
+# CONFIG_LV_FONT_UNSCII_8 is not set
+# default:
+# CONFIG_LV_FONT_UNSCII_16 is not set
+# end of Enable built-in fonts
+
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_8 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_10 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_12 is not set
+# default:
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_16 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_22 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_24 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_26 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_28 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_30 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_32 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_34 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_36 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_38 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_40 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_42 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_44 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_46 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_48 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_28_COMPRESSED is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_DEJAVU_16_PERSIAN_HEBREW is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_SIMSUN_14_CJK is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_SIMSUN_16_CJK is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_UNSCII_8 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_UNSCII_16 is not set
+# default:
+# CONFIG_LV_FONT_FMT_TXT_LARGE is not set
+# default:
+# CONFIG_LV_USE_FONT_COMPRESSED is not set
+# default:
+CONFIG_LV_USE_FONT_PLACEHOLDER=y
+# end of Font Usage
+
+#
+# Text Settings
+#
+# default:
+CONFIG_LV_TXT_ENC_UTF8=y
+# default:
+# CONFIG_LV_TXT_ENC_ASCII is not set
+# default:
+CONFIG_LV_TXT_BREAK_CHARS=" ,.;:-_)}"
+# default:
+CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=0
+# default:
+# CONFIG_LV_USE_BIDI is not set
+# default:
+# CONFIG_LV_USE_ARABIC_PERSIAN_CHARS is not set
+# end of Text Settings
+
+#
+# Widget Usage
+#
+# default:
+CONFIG_LV_WIDGETS_HAS_DEFAULT_VALUE=y
+# default:
+CONFIG_LV_USE_ANIMIMG=y
+# default:
+CONFIG_LV_USE_ARC=y
+# default:
+CONFIG_LV_USE_BAR=y
+# default:
+CONFIG_LV_USE_BUTTON=y
+# default:
+CONFIG_LV_USE_BUTTONMATRIX=y
+# default:
+CONFIG_LV_USE_CALENDAR=y
+# default:
+# CONFIG_LV_CALENDAR_WEEK_STARTS_MONDAY is not set
+# default:
+CONFIG_LV_USE_CALENDAR_HEADER_ARROW=y
+# default:
+CONFIG_LV_USE_CALENDAR_HEADER_DROPDOWN=y
+# default:
+# CONFIG_LV_USE_CALENDAR_CHINESE is not set
+# default:
+CONFIG_LV_USE_CANVAS=y
+# default:
+CONFIG_LV_USE_CHART=y
+# default:
+CONFIG_LV_USE_CHECKBOX=y
+# default:
+CONFIG_LV_USE_DROPDOWN=y
+# default:
+CONFIG_LV_USE_IMAGE=y
+# default:
+CONFIG_LV_USE_IMAGEBUTTON=y
+# default:
+CONFIG_LV_USE_KEYBOARD=y
+# default:
+CONFIG_LV_USE_LABEL=y
+# default:
+CONFIG_LV_LABEL_TEXT_SELECTION=y
+# default:
+CONFIG_LV_LABEL_LONG_TXT_HINT=y
+# default:
+CONFIG_LV_LABEL_WAIT_CHAR_COUNT=3
+# default:
+CONFIG_LV_USE_LED=y
+# default:
+CONFIG_LV_USE_LINE=y
+# default:
+CONFIG_LV_USE_LIST=y
+# default:
+CONFIG_LV_USE_MENU=y
+# default:
+CONFIG_LV_USE_MSGBOX=y
+# default:
+CONFIG_LV_USE_ROLLER=y
+# default:
+CONFIG_LV_USE_SCALE=y
+# default:
+CONFIG_LV_USE_SLIDER=y
+# default:
+CONFIG_LV_USE_SPAN=y
+# default:
+CONFIG_LV_SPAN_SNIPPET_STACK_SIZE=64
+# default:
+CONFIG_LV_USE_SPINBOX=y
+# default:
+CONFIG_LV_USE_SPINNER=y
+# default:
+CONFIG_LV_USE_SWITCH=y
+# default:
+CONFIG_LV_USE_TEXTAREA=y
+# default:
+CONFIG_LV_TEXTAREA_DEF_PWD_SHOW_TIME=1500
+# default:
+CONFIG_LV_USE_TABLE=y
+# default:
+CONFIG_LV_USE_TABVIEW=y
+# default:
+CONFIG_LV_USE_TILEVIEW=y
+# default:
+CONFIG_LV_USE_WIN=y
+# end of Widget Usage
+
+#
+# Themes
+#
+# default:
+CONFIG_LV_USE_THEME_DEFAULT=y
+# default:
+# CONFIG_LV_THEME_DEFAULT_DARK is not set
+# default:
+CONFIG_LV_THEME_DEFAULT_GROW=y
+# default:
+CONFIG_LV_THEME_DEFAULT_TRANSITION_TIME=80
+# default:
+CONFIG_LV_USE_THEME_SIMPLE=y
+# default:
+# CONFIG_LV_USE_THEME_MONO is not set
+# end of Themes
+
+#
+# Layouts
+#
+# default:
+CONFIG_LV_USE_FLEX=y
+# default:
+CONFIG_LV_USE_GRID=y
+# end of Layouts
+
+#
+# 3rd Party Libraries
+#
+# default:
+CONFIG_LV_FS_DEFAULT_DRIVE_LETTER=0
+# default:
+# CONFIG_LV_USE_FS_STDIO is not set
+# default:
+# CONFIG_LV_USE_FS_POSIX is not set
+# default:
+# CONFIG_LV_USE_FS_WIN32 is not set
+# default:
+# CONFIG_LV_USE_FS_FATFS is not set
+# default:
+# CONFIG_LV_USE_FS_MEMFS is not set
+# default:
+# CONFIG_LV_USE_FS_LITTLEFS is not set
+# default:
+# CONFIG_LV_USE_FS_ARDUINO_ESP_LITTLEFS is not set
+# default:
+# CONFIG_LV_USE_FS_ARDUINO_SD is not set
+# default:
+# CONFIG_LV_USE_LODEPNG is not set
+# default:
+# CONFIG_LV_USE_LIBPNG is not set
+# default:
+# CONFIG_LV_USE_BMP is not set
+# default:
+# CONFIG_LV_USE_TJPGD is not set
+# default:
+# CONFIG_LV_USE_LIBJPEG_TURBO is not set
+# default:
+# CONFIG_LV_USE_GIF is not set
+# default:
+# CONFIG_LV_BIN_DECODER_RAM_LOAD is not set
+# default:
+# CONFIG_LV_USE_RLE is not set
+# default:
+# CONFIG_LV_USE_QRCODE is not set
+# default:
+# CONFIG_LV_USE_BARCODE is not set
+# default:
+# CONFIG_LV_USE_FREETYPE is not set
+# default:
+# CONFIG_LV_USE_TINY_TTF is not set
+# default:
+# CONFIG_LV_USE_RLOTTIE is not set
+# default:
+# CONFIG_LV_USE_THORVG is not set
+# default:
+# CONFIG_LV_USE_LZ4 is not set
+# default:
+# CONFIG_LV_USE_FFMPEG is not set
+# end of 3rd Party Libraries
+
+#
+# Others
+#
+# default:
+# CONFIG_LV_USE_SNAPSHOT is not set
+# default:
+# CONFIG_LV_USE_SYSMON is not set
+# default:
+# CONFIG_LV_USE_PROFILER is not set
+# default:
+# CONFIG_LV_USE_MONKEY is not set
+# default:
+# CONFIG_LV_USE_GRIDNAV is not set
+# default:
+# CONFIG_LV_USE_FRAGMENT is not set
+# default:
+# CONFIG_LV_USE_IMGFONT is not set
+# default:
+CONFIG_LV_USE_OBSERVER=y
+# default:
+# CONFIG_LV_USE_IME_PINYIN is not set
+# default:
+# CONFIG_LV_USE_FILE_EXPLORER is not set
+# default:
+CONFIG_LVGL_VERSION_MAJOR=9
+# default:
+CONFIG_LVGL_VERSION_MINOR=2
+# default:
+CONFIG_LVGL_VERSION_PATCH=2
+# end of Others
+
+#
+# Devices
+#
+# default:
+# CONFIG_LV_USE_SDL is not set
+# default:
+# CONFIG_LV_USE_X11 is not set
+# default:
+# CONFIG_LV_USE_WAYLAND is not set
+# default:
+# CONFIG_LV_USE_LINUX_FBDEV is not set
+# default:
+# CONFIG_LV_USE_NUTTX is not set
+# default:
+# CONFIG_LV_USE_LINUX_DRM is not set
+# default:
+# CONFIG_LV_USE_TFT_ESPI is not set
+# default:
+# CONFIG_LV_USE_EVDEV is not set
+# default:
+# CONFIG_LV_USE_LIBINPUT is not set
+# default:
+# CONFIG_LV_USE_ST7735 is not set
+# default:
+# CONFIG_LV_USE_ST7789 is not set
+# default:
+# CONFIG_LV_USE_ST7796 is not set
+# default:
+# CONFIG_LV_USE_ILI9341 is not set
+# default:
+# CONFIG_LV_USE_GENERIC_MIPI is not set
+# default:
+# CONFIG_LV_USE_RENESAS_GLCDC is not set
+# default:
+# CONFIG_LV_USE_OPENGLES is not set
+# default:
+# CONFIG_LV_USE_QNX is not set
+# end of Devices
+
+#
+# Examples
+#
+# default:
+CONFIG_LV_BUILD_EXAMPLES=y
+# end of Examples
+
+#
+# Demos
+#
+# default:
+# CONFIG_LV_USE_DEMO_WIDGETS is not set
+# default:
+# CONFIG_LV_USE_DEMO_KEYPAD_AND_ENCODER is not set
+# default:
+# CONFIG_LV_USE_DEMO_RENDER is not set
+# default:
+# CONFIG_LV_USE_DEMO_SCROLL is not set
+# default:
+# CONFIG_LV_USE_DEMO_STRESS is not set
+# default:
+# CONFIG_LV_USE_DEMO_MUSIC is not set
+# default:
+# CONFIG_LV_USE_DEMO_FLEX_LAYOUT is not set
+# default:
+# CONFIG_LV_USE_DEMO_MULTILANG is not set
+# end of Demos
+# end of LVGL configuration
 # end of Component config
 
 # default:
@@ -3529,7 +4277,6 @@ CONFIG_GDBSTUB_MAX_TASKS=32
 # CONFIG_TWO_UNIVERSAL_MAC_ADDRESS is not set
 CONFIG_FOUR_UNIVERSAL_MAC_ADDRESS=y
 CONFIG_NUMBER_OF_UNIVERSAL_MAC_ADDRESS=4
-# CONFIG_ESP_SYSTEM_PD_FLASH is not set
 CONFIG_ESP32_DEEP_SLEEP_WAKEUP_DELAY=2000
 CONFIG_ESP_SLEEP_DEEP_SLEEP_WAKEUP_DELAY=2000
 CONFIG_ESP32_RTC_CLK_SRC_INT_RC=y
@@ -3589,8 +4336,9 @@ CONFIG_ESP32_PHY_MAX_WIFI_TX_POWER=20
 CONFIG_ESP32_PHY_MAX_TX_POWER=20
 # CONFIG_REDUCE_PHY_TX_POWER is not set
 # CONFIG_ESP32_REDUCE_PHY_TX_POWER is not set
-# CONFIG_SPIRAM_SUPPORT is not set
-# CONFIG_ESP32_SPIRAM_SUPPORT is not set
+CONFIG_SPIRAM_SUPPORT=y
+CONFIG_ESP32_SPIRAM_SUPPORT=y
+# CONFIG_WIFI_LWIP_ALLOCATION_FROM_SPIRAM_FIRST is not set
 CONFIG_CONSOLE_UART_DEFAULT=y
 # CONFIG_CONSOLE_UART_CUSTOM is not set
 # CONFIG_CONSOLE_UART_NONE is not set
@@ -3599,9 +4347,9 @@ CONFIG_CONSOLE_UART=y
 CONFIG_CONSOLE_UART_NUM=0
 CONFIG_CONSOLE_UART_BAUDRATE=115200
 # CONFIG_ESP32_DEFAULT_CPU_FREQ_80 is not set
-CONFIG_ESP32_DEFAULT_CPU_FREQ_160=y
-# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 is not set
-CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=160
+# CONFIG_ESP32_DEFAULT_CPU_FREQ_160 is not set
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=240
 CONFIG_TRACEMEM_RESERVE_DRAM=0x0
 # CONFIG_ESP32_PANIC_PRINT_HALT is not set
 CONFIG_ESP32_PANIC_PRINT_REBOOT=y
@@ -3609,9 +4357,9 @@ CONFIG_ESP32_PANIC_PRINT_REBOOT=y
 # CONFIG_ESP32_PANIC_GDBSTUB is not set
 CONFIG_SYSTEM_EVENT_QUEUE_SIZE=32
 CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=2304
-CONFIG_MAIN_TASK_STACK_SIZE=3584
+CONFIG_MAIN_TASK_STACK_SIZE=8192
 CONFIG_INT_WDT=y
-CONFIG_INT_WDT_TIMEOUT_MS=300
+CONFIG_INT_WDT_TIMEOUT_MS=800
 CONFIG_INT_WDT_CHECK_CPU1=y
 CONFIG_TASK_WDT=y
 CONFIG_ESP_TASK_WDT=y
@@ -3691,6 +4439,7 @@ CONFIG_TIMER_TASK_PRIORITY=1
 CONFIG_TIMER_TASK_STACK_DEPTH=2048
 CONFIG_TIMER_QUEUE_LENGTH=10
 # CONFIG_ENABLE_STATIC_TASK_CLEAN_UP_HOOK is not set
+# CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is not set
 # CONFIG_HAL_ASSERTION_SILIENT is not set
 # CONFIG_L2_TO_L3_COPY is not set
 CONFIG_ESP_GRATUITOUS_ARP=y

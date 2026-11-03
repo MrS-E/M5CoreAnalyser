@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File for M5CoreAnalyser
+dependencies:
+  idf:
+    version: ">=6.0.0"
+  lvgl/lvgl: "~9.2.0"
+  espressif/esp_lcd_touch: "^1.2.0"
