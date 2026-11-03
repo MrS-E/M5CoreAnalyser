@@ -3583,6 +3583,13 @@ CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
 
 #
+# M5CoreAnalyser Tool Core Configuration
+#
+# default:
+# CONFIG_ANALYSER_RUN_SELFTEST_ON_BOOT is not set
+# end of M5CoreAnalyser Tool Core Configuration
+
+#
 # ESP LCD TOUCH
 #
 # default:
@@ -4196,8 +4203,7 @@ CONFIG_LVGL_VERSION_PATCH=2
 #
 # Examples
 #
-# default:
-CONFIG_LV_BUILD_EXAMPLES=y
+# CONFIG_LV_BUILD_EXAMPLES is not set
 # end of Examples
 
 #

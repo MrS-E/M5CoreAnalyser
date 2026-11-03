@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "ui_shell.c"
+        "ui_header.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        bsp_m5core2
+        tool_core
+        recorder_sink
+        lvgl
+        esp_lcd
+        esp_timer
+        heap
+        freertos
+        log
+)
