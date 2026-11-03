@@ -108,6 +108,12 @@ void scope_audio_example(const uint16_t *adc_batch, size_t count)
 
 ---
 
+## ADC1 Read Semantics & Test-Only Mock Fallback
+- `bsp_adc1_read_raw()` always calls `adc_oneshot_read()` in production builds (`CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK=n`, the default). A hardware read error is returned to the caller unchanged; it is never replaced with a substitute value.
+- The only substitute path is the Kconfig option `CONFIG_BSP_ADC1_QEMU_MIDSCALE_FALLBACK` (`components/bsp_m5core2/Kconfig`). It is enabled only in `test_app/sdkconfig.defaults`, because the ESP32 QEMU machine does not emulate the SAR ADC (SENS) registers and `adc_oneshot_read()` would spin forever there. With the option on, `bsp_adc1_read_raw()` returns a constant `2048` and `ESP_OK`.
+- `bsp_adc1_uses_mock_fallback()` reports which mode is compiled in. Production firmware never probes or writes raw SENS registers.
+- Under QEMU, tests can check ADC timing and metadata, but not waveform content.
+
 ## Limitations
 - **Safe Voltage Range**: Direct ESP32 GPIO and ADC1 inputs (`GPIO36`/`GPIO35`) operate over `0.0 V – 3.3 V` only; external attenuation is required for higher voltages.
 - **Input-Only Pins**: `GPIO35` and `GPIO36` are input-only on ESP32 and cannot be used by `tool_wavegen` or `tool_analoggen`.
