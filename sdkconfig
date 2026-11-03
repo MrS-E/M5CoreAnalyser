@@ -3594,7 +3594,7 @@ CONFIG_ESP_LCD_TOUCH_MAX_BUTTONS=1
 #
 # LVGL configuration
 #
-# CONFIG_LV_CONF_SKIP is not set
+CONFIG_LV_CONF_SKIP=y
 # default:
 # CONFIG_LV_CONF_MINIMAL is not set
 

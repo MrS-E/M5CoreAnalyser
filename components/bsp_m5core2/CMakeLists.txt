@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "bsp_m5core2.c"
+        "bsp_axp192.c"
+        "bsp_pin_manager.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_spi
+        esp_lcd
+        esp_adc
+        esp_psram
+        heap
+        freertos
+        log
+)
