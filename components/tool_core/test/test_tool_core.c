@@ -8,11 +8,12 @@
 #include <string.h>
 
 #include "bsp_m5core2.h"
-#include "../priv_include/tool_core_priv.h"
-#include "../../bsp_m5core2/priv_include/bsp_m5core2_priv.h"
+#include "bsp_m5core2_priv.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "tool_core.h"
+#include "tool_core_priv.h"
 #include "unity.h"
 
 typedef struct {
@@ -28,6 +29,33 @@ typedef struct {
     esp_err_t force_init_err;
     esp_err_t force_start_err;
 } mock_tool_ctx_t;
+
+static esp_err_t mock_spk_i2s_init(uint32_t rate)
+{
+    (void)rate;
+    return ESP_OK;
+}
+
+static esp_err_t mock_spk_i2s_write(const int16_t *pcm, size_t len, size_t *out_written, uint32_t timeout_ms)
+{
+    (void)pcm;
+    (void)timeout_ms;
+    if (out_written != NULL) {
+        *out_written = len;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t mock_spk_i2s_disable(void)
+{
+    return ESP_OK;
+}
+
+static const bsp_spk_i2s_ops_t s_mock_spk_i2s_ops = {
+    .ensure_init = mock_spk_i2s_init,
+    .write_pcm = mock_spk_i2s_write,
+    .disable = mock_spk_i2s_disable,
+};
 
 static esp_err_t mock_tool_on_init(void *ctx)
 {
@@ -185,14 +213,16 @@ TEST_CASE("given tool descriptors when registered then duplicates and invalid fi
     TEST_ASSERT_EQUAL_STRING("Generator", tool_category_to_str(TOOL_CATEGORY_GENERATOR));
 }
 
-TEST_CASE("given background generator and foreground tools when switched then concurrency and pin ownership transition safely", "[tool_core][lifecycle]")
+TEST_CASE("given background generator and foreground tools when switched then concurrency pin ownership and speaker gating transition safely", "[tool_core][lifecycle]")
 {
     tool_registry_test_reset();
     bsp_pin_manager_reset();
+    bsp_spk_passthrough_set_i2s_ops(&s_mock_spk_i2s_ops);
 
-    mock_tool_ctx_t wave_ctx  = {.id = "wavegen", .pin = BSP_PIN_PORT_C_TXD2, .require_output = true};
-    mock_tool_ctx_t scope_ctx = {.id = "scope", .pin = BSP_PIN_ANALOG_IN_DEFAULT, .require_output = false};
-    mock_tool_ctx_t logic_ctx = {.id = "logic", .pin = BSP_PIN_PORT_C_TXD2, .require_output = false};
+    mock_tool_ctx_t wave_ctx   = {.id = "wavegen", .pin = BSP_PIN_PORT_C_TXD2, .require_output = true};
+    mock_tool_ctx_t analog_ctx = {.id = "analoggen", .pin = BSP_PIN_DAC_OUT_CH1, .require_output = true};
+    mock_tool_ctx_t scope_ctx  = {.id = "scope", .pin = BSP_PIN_ANALOG_IN_DEFAULT, .require_output = false};
+    mock_tool_ctx_t logic_ctx  = {.id = "logic", .pin = BSP_PIN_PORT_C_TXD2, .require_output = false};
 
     const analyser_tool_t wave_tool = {
         .id = "wavegen",
@@ -200,10 +230,24 @@ TEST_CASE("given background generator and foreground tools when switched then co
         .symbol = LV_SYMBOL_REFRESH,
         .category = TOOL_CATEGORY_GENERATOR,
         .supports_background = true,
+        .supports_spk_passthrough = false,
         .on_start = mock_tool_on_start,
         .on_stop = mock_tool_on_stop,
         .is_running_bg = mock_tool_is_running_bg,
         .user_ctx = &wave_ctx,
+    };
+
+    const analyser_tool_t analog_tool = {
+        .id = "analoggen",
+        .title = "Analog Generator",
+        .symbol = LV_SYMBOL_AUDIO,
+        .category = TOOL_CATEGORY_GENERATOR,
+        .supports_background = true,
+        .supports_spk_passthrough = true,
+        .on_start = mock_tool_on_start,
+        .on_stop = mock_tool_on_stop,
+        .is_running_bg = mock_tool_is_running_bg,
+        .user_ctx = &analog_ctx,
     };
 
     const analyser_tool_t scope_tool = {
@@ -232,6 +276,7 @@ TEST_CASE("given background generator and foreground tools when switched then co
     };
 
     TEST_ASSERT_EQUAL(ESP_OK, tool_registry_register(&wave_tool));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_registry_register(&analog_tool));
     TEST_ASSERT_EQUAL(ESP_OK, tool_registry_register(&scope_tool));
     TEST_ASSERT_EQUAL(ESP_OK, tool_registry_register(&logic_tool_conflicting));
 
@@ -248,35 +293,71 @@ TEST_CASE("given background generator and foreground tools when switched then co
     TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)tool_core_get_background_count());
     TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_TXD2, "wavegen"));
 
-    /* 3. Open scope on GPIO36 while wavegen runs in background on GPIO14 */
+    /* 3. Open scope on GPIO36 while wavegen runs in background on GPIO14; enable speaker */
     TEST_ASSERT_EQUAL(ESP_OK, tool_core_start_tool("scope", NULL));
     TEST_ASSERT_EQUAL_PTR(&scope_tool, tool_core_get_active_tool());
     TEST_ASSERT_TRUE(tool_core_is_tool_running_bg("wavegen"));
     TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_TXD2, "wavegen"));
     TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, "scope"));
 
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(true, BSP_SPK_DEFAULT_RATE_HZ));
+    TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
+
     tool_core_ui_refresh_active();
     TEST_ASSERT_EQUAL(1, scope_ctx.refresh_calls);
 
-    /* 4. Attempting to keep a non-background tool (scope) in background forces full stop */
+    /* 4. Stopping scope (when only non-speaker wavegen is in BG) automatically disables speaker */
     TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(true));
     TEST_ASSERT_FALSE(tool_core_is_tool_running_bg("scope"));
     TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, "scope"));
     TEST_ASSERT_TRUE(tool_core_is_tool_running_bg("wavegen"));
+    TEST_ASSERT_FALSE(bsp_spk_passthrough_is_enabled());
 
-    /* 5. Starting logic analyzer on conflicting pin GPIO14 fails without stealing wavegen's pin */
+    /* 5. Start analoggen (supports_background=true, supports_spk_passthrough=true) and enable speaker */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_start_tool("analoggen", NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(true, BSP_SPK_DEFAULT_RATE_HZ));
+    TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
+
+    /* Move analoggen to background -> speaker stays enabled */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(true));
+    TEST_ASSERT_TRUE(tool_core_is_tool_running_bg("analoggen"));
+    TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
+
+    /* Open and exit scope while analoggen is in background -> speaker remains enabled for analoggen */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_start_tool("scope", NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(false));
+    TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
+
+    /* Stopping background analoggen disables speaker passthrough */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_background_tool("analoggen"));
+    TEST_ASSERT_FALSE(tool_core_is_tool_running_bg("analoggen"));
+    TEST_ASSERT_FALSE(bsp_spk_passthrough_is_enabled());
+
+    /* Also verify stop_all_background_tools gates off speaker when analoggen is in background */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_start_tool("analoggen", NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(true, BSP_SPK_DEFAULT_RATE_HZ));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(true));
+    TEST_ASSERT_TRUE(bsp_spk_passthrough_is_enabled());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_all_background_tools());
+    TEST_ASSERT_FALSE(bsp_spk_passthrough_is_enabled());
+
+    /* Restart wavegen in background to verify pin conflict protection */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_start_tool("wavegen", NULL));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(true));
+
+    /* 6. Starting logic analyzer on conflicting pin GPIO14 fails without stealing wavegen's pin */
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, tool_core_start_tool("logic", NULL));
     TEST_ASSERT_NULL(tool_core_get_active_tool());
     TEST_ASSERT_TRUE(tool_core_is_tool_running_bg("wavegen"));
     TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_TXD2, "wavegen"));
 
-    /* 6. Re-opening wavegen promotes it from background back to foreground */
+    /* 7. Re-opening wavegen promotes it from background back to foreground */
     TEST_ASSERT_EQUAL(ESP_OK, tool_core_start_tool("wavegen", NULL));
     TEST_ASSERT_EQUAL_PTR(&wave_tool, tool_core_get_active_tool());
     TEST_ASSERT_FALSE(tool_core_is_tool_running_bg("wavegen"));
     TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)tool_core_get_background_count());
 
-    /* 7. Stopping wavegen in background releases GPIO14 so logic analyzer can now start */
+    /* 8. Stopping wavegen in background releases GPIO14 so logic analyzer can now start */
     TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(true));
     TEST_ASSERT_TRUE(tool_core_is_tool_running_bg("wavegen"));
     TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_background_tool("wavegen"));
@@ -287,9 +368,11 @@ TEST_CASE("given background generator and foreground tools when switched then co
     TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_TXD2, "logic"));
     TEST_ASSERT_EQUAL(ESP_OK, tool_core_stop_active_tool(false));
     TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_TXD2, "logic"));
+
+    bsp_spk_passthrough_set_i2s_ops(NULL);
 }
 
-TEST_CASE("given psram_double_buf when allocated swapped and copied then buffers alternate atomically and OOM rolls back", "[tool_core][psram]")
+TEST_CASE("given psram_double_buf when allocated swapped acquired and copied then reader slot is tear-free and OOM rolls back", "[tool_core][psram]")
 {
     psram_buf_test_set_fail_after(-1);
 
@@ -299,26 +382,44 @@ TEST_CASE("given psram_double_buf when allocated swapped and copied then buffers
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, psram_double_buf_alloc(&dbuf, 64, 0));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, psram_double_buf_alloc(&dbuf, (SIZE_MAX / 2U) + 2U, 4));
 
-    /* Inject OOM on second buffer allocation to verify buf_a is freed cleanly */
+    /* Inject OOM on 1st, 2nd, and 3rd slot allocations to verify clean rollback */
+    psram_buf_test_set_fail_after(0);
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, psram_double_buf_alloc(&dbuf, 128, sizeof(uint16_t)));
+    TEST_ASSERT_NULL(dbuf.buf_a);
+    TEST_ASSERT_NULL(dbuf.buf_b);
+    TEST_ASSERT_NULL(dbuf.buf_c);
+
     psram_buf_test_set_fail_after(1);
     TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, psram_double_buf_alloc(&dbuf, 128, sizeof(uint16_t)));
     TEST_ASSERT_NULL(dbuf.buf_a);
     TEST_ASSERT_NULL(dbuf.buf_b);
+    TEST_ASSERT_NULL(dbuf.buf_c);
+
+    psram_buf_test_set_fail_after(2);
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, psram_double_buf_alloc(&dbuf, 128, sizeof(uint16_t)));
+    TEST_ASSERT_NULL(dbuf.buf_a);
+    TEST_ASSERT_NULL(dbuf.buf_b);
+    TEST_ASSERT_NULL(dbuf.buf_c);
     psram_buf_test_set_fail_after(-1);
 
-    /* Allocate 300-sample double buffer */
+    /* Allocate 300-sample 3-slot buffer */
     TEST_ASSERT_EQUAL(ESP_OK, psram_double_buf_alloc(&dbuf, 300, sizeof(uint16_t)));
     TEST_ASSERT_NOT_NULL(dbuf.buf_a);
     TEST_ASSERT_NOT_NULL(dbuf.buf_b);
+    TEST_ASSERT_NOT_NULL(dbuf.buf_c);
     TEST_ASSERT_NOT_EQUAL(dbuf.buf_a, dbuf.buf_b);
-    TEST_ASSERT_EQUAL_UINT8(0, dbuf.active_write_idx);
+    TEST_ASSERT_NOT_EQUAL(dbuf.buf_b, dbuf.buf_c);
+    TEST_ASSERT_NOT_EQUAL(dbuf.buf_a, dbuf.buf_c);
+    TEST_ASSERT_EQUAL_UINT8(0U, dbuf.active_write_idx);
+    TEST_ASSERT_EQUAL_UINT8(1U, dbuf.ready_idx);
+    TEST_ASSERT_EQUAL_UINT8(2U, dbuf.active_read_idx);
     TEST_ASSERT_FALSE(dbuf.frame_ready);
 
-    /* Initially write_ptr is buf_a and read_ptr is buf_b */
+    /* Initially write_ptr is buf_a (0) and read_ptr is buf_c (2) */
     uint16_t *w0 = (uint16_t *)psram_double_buf_get_write_ptr(&dbuf);
     const uint16_t *r0 = (const uint16_t *)psram_double_buf_get_read_ptr(&dbuf);
     TEST_ASSERT_EQUAL_PTR(dbuf.buf_a, w0);
-    TEST_ASSERT_EQUAL_PTR(dbuf.buf_b, r0);
+    TEST_ASSERT_EQUAL_PTR(dbuf.buf_c, r0);
 
     for (size_t i = 0; i < 300; ++i) {
         w0[i] = (uint16_t)(1000U + i);
@@ -326,27 +427,55 @@ TEST_CASE("given psram_double_buf when allocated swapped and copied then buffers
 
     const void *ready_ptr = NULL;
     TEST_ASSERT_FALSE(psram_double_buf_consume_ready(&dbuf, &ready_ptr));
+    TEST_ASSERT_FALSE(psram_double_buf_acquire_read(&dbuf, &ready_ptr));
 
-    /* Swap buffers: active_write_idx becomes 1 (buf_b), read buffer becomes buf_a */
+    /* Swap 1: write_idx becomes 1 (buf_b), ready_idx becomes 0 (buf_a) */
     TEST_ASSERT_EQUAL(ESP_OK, psram_double_buf_swap(&dbuf));
-    TEST_ASSERT_EQUAL_UINT8(1, dbuf.active_write_idx);
+    TEST_ASSERT_EQUAL_UINT8(1U, dbuf.active_write_idx);
+    TEST_ASSERT_EQUAL_UINT8(0U, dbuf.ready_idx);
     TEST_ASSERT_TRUE(dbuf.frame_ready);
     TEST_ASSERT_EQUAL_PTR(dbuf.buf_b, psram_double_buf_get_write_ptr(&dbuf));
-    TEST_ASSERT_EQUAL_PTR(dbuf.buf_a, psram_double_buf_get_read_ptr(&dbuf));
 
+    /* Consumer latches ready_idx (buf_a) into active_read_idx */
     TEST_ASSERT_TRUE(psram_double_buf_consume_ready(&dbuf, &ready_ptr));
     TEST_ASSERT_EQUAL_PTR(dbuf.buf_a, ready_ptr);
+    TEST_ASSERT_EQUAL_PTR(dbuf.buf_a, psram_double_buf_get_read_ptr(&dbuf));
     TEST_ASSERT_FALSE(dbuf.frame_ready);
 
-    /* Write second frame into buf_b, swap, and copy out via psram_double_buf_read_copy */
-    uint16_t *w1 = (uint16_t *)psram_double_buf_get_write_ptr(&dbuf);
+    /* Verify tear-free guarantee: even if producer writes & swaps multiple times while
+     * consumer is reading ready_ptr (buf_a), producer ONLY alternates between buf_b and buf_c! */
+    for (uint16_t round = 0; round < 5; ++round) {
+        uint16_t *wn = (uint16_t *)psram_double_buf_get_write_ptr(&dbuf);
+        TEST_ASSERT_NOT_EQUAL(ready_ptr, wn);
+        for (size_t i = 0; i < 300; ++i) {
+            wn[i] = (uint16_t)(9000U + round);
+        }
+        TEST_ASSERT_EQUAL(ESP_OK, psram_double_buf_swap(&dbuf));
+    }
+    const uint16_t *latched_samples = (const uint16_t *)ready_ptr;
+    TEST_ASSERT_EQUAL_UINT16(1000U, latched_samples[0]);
+    TEST_ASSERT_EQUAL_UINT16(1299U, latched_samples[299]);
+
+    /* Verify explicit acquire_read / release_read and reader_busy protection */
+    const void *acq_ptr = NULL;
+    TEST_ASSERT_TRUE(psram_double_buf_acquire_read(&dbuf, &acq_ptr));
+    TEST_ASSERT_NOT_NULL(acq_ptr);
+    TEST_ASSERT_TRUE(dbuf.reader_busy);
+    /* Second acquire or read_copy while reader_busy is rejected */
+    const void *acq_second = NULL;
+    uint16_t copy_dst[300] = {0};
+    TEST_ASSERT_FALSE(psram_double_buf_acquire_read(&dbuf, &acq_second));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, psram_double_buf_read_copy(&dbuf, copy_dst, 300, NULL));
+    psram_double_buf_release_read(&dbuf);
+    TEST_ASSERT_FALSE(dbuf.reader_busy);
+
+    /* Write new frame, swap, and copy out via psram_double_buf_read_copy (outside spinlock) */
+    uint16_t *w_final = (uint16_t *)psram_double_buf_get_write_ptr(&dbuf);
     for (size_t i = 0; i < 300; ++i) {
-        w1[i] = (uint16_t)(2000U + i);
+        w_final[i] = (uint16_t)(2000U + i);
     }
     TEST_ASSERT_EQUAL(ESP_OK, psram_double_buf_swap(&dbuf));
-    TEST_ASSERT_EQUAL_UINT8(0, dbuf.active_write_idx);
 
-    uint16_t copy_dst[300] = {0};
     size_t copied = 0;
     TEST_ASSERT_EQUAL(ESP_OK, psram_double_buf_read_copy(&dbuf, copy_dst, 300, &copied));
     TEST_ASSERT_EQUAL_UINT32(300, (uint32_t)copied);
@@ -357,11 +486,112 @@ TEST_CASE("given psram_double_buf when allocated swapped and copied then buffers
     psram_double_buf_free(&dbuf);
     TEST_ASSERT_NULL(dbuf.buf_a);
     TEST_ASSERT_NULL(dbuf.buf_b);
+    TEST_ASSERT_NULL(dbuf.buf_c);
+}
+
+#define CONCURRENT_FRAME_SAMPLES (256U)
+
+typedef struct {
+    psram_double_buf_t *dbuf;
+    volatile bool stop;
+    volatile uint32_t frames_written;
+    SemaphoreHandle_t done_sem;
+} concurrent_producer_ctx_t;
+
+static void concurrent_producer_task(void *arg)
+{
+    concurrent_producer_ctx_t *ctx = (concurrent_producer_ctx_t *)arg;
+    uint32_t seq = 1U;
+    while (!ctx->stop) {
+        uint32_t *wptr = (uint32_t *)psram_double_buf_get_write_ptr(ctx->dbuf);
+        if (wptr != NULL) {
+            for (size_t i = 0; i < CONCURRENT_FRAME_SAMPLES; ++i) {
+                wptr[i] = (seq << 12) | (uint32_t)i;
+            }
+            (void)psram_double_buf_swap(ctx->dbuf);
+            ctx->frames_written = seq;
+            seq++;
+        }
+        if ((seq & 0x1FU) == 0U) {
+            taskYIELD();
+        }
+    }
+    (void)xSemaphoreGive(ctx->done_sem);
+    vTaskDelete(NULL);
+}
+
+TEST_CASE("given concurrent Core 1 producer and Core 0 consumer when hammering swaps and reads then zero torn frames occur", "[tool_core][psram][concurrency]")
+{
+    psram_double_buf_t dbuf = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, psram_double_buf_alloc(&dbuf, CONCURRENT_FRAME_SAMPLES, sizeof(uint32_t)));
+
+    StaticSemaphore_t sem_buf;
+    concurrent_producer_ctx_t pctx = {
+        .dbuf = &dbuf,
+        .stop = false,
+        .frames_written = 0,
+        .done_sem = xSemaphoreCreateBinaryStatic(&sem_buf),
+    };
+
+    BaseType_t prod_core = (portNUM_PROCESSORS > 1) ? 1 : tskNO_AFFINITY;
+    TaskHandle_t prod_task = NULL;
+    TEST_ASSERT_EQUAL(pdPASS,
+                      xTaskCreatePinnedToCore(
+                          concurrent_producer_task, "dbuf_prod_c1", 4096, &pctx, 5, &prod_task, prod_core));
+
+    uint32_t copy_buf[CONCURRENT_FRAME_SAMPLES] = {0};
+    uint32_t last_seq = 0;
+    uint32_t verified_frames = 0;
+    uint32_t attempts = 0;
+
+    while (verified_frames < 120U && attempts < 20000U) {
+        attempts++;
+        if ((verified_frames & 1U) == 0U) {
+            const void *rptr = NULL;
+            if (psram_double_buf_acquire_read(&dbuf, &rptr)) {
+                const uint32_t *samples = (const uint32_t *)rptr;
+                uint32_t seq = samples[0] >> 12;
+                TEST_ASSERT_GREATER_OR_EQUAL_UINT32(last_seq, seq);
+                for (size_t i = 0; i < CONCURRENT_FRAME_SAMPLES; ++i) {
+                    TEST_ASSERT_EQUAL_UINT32((seq << 12) | (uint32_t)i, samples[i]);
+                }
+                last_seq = seq;
+                verified_frames++;
+                psram_double_buf_release_read(&dbuf);
+            }
+        } else {
+            if (dbuf.frame_ready) {
+                size_t copied = 0;
+                TEST_ASSERT_EQUAL(ESP_OK,
+                                  psram_double_buf_read_copy(&dbuf, copy_buf, CONCURRENT_FRAME_SAMPLES, &copied));
+                TEST_ASSERT_EQUAL_UINT32(CONCURRENT_FRAME_SAMPLES, (uint32_t)copied);
+                uint32_t seq = copy_buf[0] >> 12;
+                TEST_ASSERT_GREATER_OR_EQUAL_UINT32(last_seq, seq);
+                for (size_t i = 0; i < CONCURRENT_FRAME_SAMPLES; ++i) {
+                    TEST_ASSERT_EQUAL_UINT32((seq << 12) | (uint32_t)i, copy_buf[i]);
+                }
+                last_seq = seq;
+                verified_frames++;
+            }
+        }
+        if ((attempts & 0x0FU) == 0U) {
+            taskYIELD();
+        }
+    }
+
+    pctx.stop = true;
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(pctx.done_sem, pdMS_TO_TICKS(1000)));
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(120U, verified_frames);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, pctx.frames_written);
+
+    psram_double_buf_free(&dbuf);
 }
 
 typedef struct {
     volatile uint32_t iterations;
     BaseType_t observed_core;
+    esp_err_t return_err;
+    uint32_t sleep_ms;
 } worker_test_ctx_t;
 
 static esp_err_t test_worker_step(void *user_ctx)
@@ -369,7 +599,10 @@ static esp_err_t test_worker_step(void *user_ctx)
     worker_test_ctx_t *ctx = (worker_test_ctx_t *)user_ctx;
     ctx->observed_core = xPortGetCoreID();
     ctx->iterations++;
-    return ESP_OK;
+    if (ctx->sleep_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(ctx->sleep_ms));
+    }
+    return ctx->return_err;
 }
 
 static esp_err_t sample_selftest_ok(void)
@@ -377,13 +610,15 @@ static esp_err_t sample_selftest_ok(void)
     return ESP_OK;
 }
 
-TEST_CASE("given tool_worker and selftest runner when started and stopped then worker executes on Core 1 and joins cleanly", "[tool_core][worker]")
+TEST_CASE("given tool_worker and selftest runner when started stopped or failing then worker handles Core 1 errors and timeouts cleanly", "[tool_core][worker]")
 {
     tool_registry_test_reset();
 
     worker_test_ctx_t wctx = {
         .iterations = 0,
         .observed_core = -1,
+        .return_err = ESP_OK,
+        .sleep_ms = 0,
     };
 
     tool_worker_config_t cfg = {
@@ -407,6 +642,36 @@ TEST_CASE("given tool_worker and selftest runner when started and stopped then w
     TEST_ASSERT_EQUAL(1, wctx.observed_core);
 #endif
 
+    TEST_ASSERT_EQUAL(ESP_OK, tool_worker_stop(worker, 500));
+
+    /* Verify worker step returning an error exits early and sets running = false */
+    worker_test_ctx_t err_ctx = {
+        .iterations = 0,
+        .observed_core = -1,
+        .return_err = ESP_FAIL,
+        .sleep_ms = 0,
+    };
+    cfg.user_ctx = &err_ctx;
+    worker = NULL;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_worker_start(&worker, &cfg));
+    vTaskDelay(pdMS_TO_TICKS(20));
+    TEST_ASSERT_EQUAL_UINT32(1U, err_ctx.iterations);
+    TEST_ASSERT_FALSE(tool_worker_is_running(worker));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_worker_stop(worker, 100));
+
+    /* Verify worker stop timeout returns ESP_ERR_TIMEOUT and keeps handle valid for retry */
+    worker_test_ctx_t slow_ctx = {
+        .iterations = 0,
+        .observed_core = -1,
+        .return_err = ESP_OK,
+        .sleep_ms = 80,
+    };
+    cfg.user_ctx = &slow_ctx;
+    worker = NULL;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_worker_start(&worker, &cfg));
+    vTaskDelay(pdMS_TO_TICKS(10));
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, tool_worker_stop(worker, 5));
+    TEST_ASSERT_TRUE(tool_worker_stop_requested(worker));
     TEST_ASSERT_EQUAL(ESP_OK, tool_worker_stop(worker, 500));
 
     /* Verify non-disruptive self-test runner */

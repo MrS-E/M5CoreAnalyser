@@ -8,7 +8,7 @@
 #include <string.h>
 
 #include "recorder_sink.h"
-#include "../priv_include/recorder_sink_priv.h"
+#include "recorder_sink_priv.h"
 #include "unity.h"
 
 TEST_CASE("given recorder_sink when mode and transport switched then state transitions and badges update", "[recorder_sink]")
