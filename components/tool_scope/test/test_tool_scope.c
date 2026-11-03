@@ -10,6 +10,10 @@
 
 #include "bsp_m5core2.h"
 #include "bsp_m5core2_priv.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "recorder_sink.h"
 #include "recorder_sink_priv.h"
 #include "tool_core.h"
@@ -22,6 +26,9 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+static uint32_t s_mock_scope_i2s_write_calls = 0;
+static size_t s_mock_scope_i2s_last_samples = 0;
 
 static esp_err_t mock_scope_i2s_init(uint32_t rate)
 {
@@ -36,6 +43,8 @@ static esp_err_t mock_scope_i2s_write(const int16_t *pcm,
 {
     (void)pcm;
     (void)timeout_ms;
+    s_mock_scope_i2s_write_calls++;
+    s_mock_scope_i2s_last_samples = len / sizeof(int16_t);
     if (out_written != NULL) {
         *out_written = len;
     }
@@ -174,6 +183,26 @@ TEST_CASE("given each requested timebase when sample scheduling and viewport mat
 
     TEST_ASSERT_EQUAL_UINT32(0U, scope_dsp_target_sample_interval_ns((scope_timebase_t)SCOPE_TB_COUNT));
     TEST_ASSERT_EQUAL_UINT32(0U, scope_dsp_viewport_us(0U, 1U, SCOPE_CHART_POINTS));
+
+    /* Speaker resampler: slow sweeps (< 4 kHz) return 0 samples; >= 4 kHz resamples to 16 kHz */
+    uint16_t in_ramp[128];
+    uint16_t out_spk[256] = {0};
+    for (size_t i = 0; i < 128; ++i) {
+        in_ramp[i] = (uint16_t)(i * 20U);
+    }
+    TEST_ASSERT_EQUAL_UINT32(0U,
+                             (uint32_t)scope_dsp_resample_for_speaker(in_ramp, 128, 600U, 16000U, out_spk, 256));
+    TEST_ASSERT_EQUAL_UINT32(0U,
+                             (uint32_t)scope_dsp_resample_for_speaker(in_ramp, 128, 3000U, 16000U, out_spk, 256));
+    size_t n_16k = scope_dsp_resample_for_speaker(in_ramp, 128, 16000U, 16000U, out_spk, 256);
+    TEST_ASSERT_EQUAL_UINT32(128U, (uint32_t)n_16k);
+    TEST_ASSERT_EQUAL_UINT16(in_ramp[64], out_spk[64]);
+
+    size_t n_8k = scope_dsp_resample_for_speaker(in_ramp, 128, 8000U, 16000U, out_spk, 256);
+    TEST_ASSERT_EQUAL_UINT32(255U, (uint32_t)n_8k);
+    /* At 2x upsampling, out_spk[1] is midpoint between in_ramp[0] (0) and in_ramp[1] (20) -> 10 */
+    TEST_ASSERT_EQUAL_UINT16(10U, out_spk[1]);
+    TEST_ASSERT_EQUAL_UINT16(20U, out_spk[2]);
 }
 
 TEST_CASE("given PWM sine and 0V 3.3V rail buffers when metrics are computed then Vpp Vavg Vrms Freq and Duty are accurate", "[tool_scope][metrics]")
@@ -314,5 +343,77 @@ TEST_CASE("given registered tool_scope when started configured and stepped then 
 
     tool_scope_set_sample_source(NULL, NULL);
     (void)tool_scope_set_pin(BSP_PIN_ANALOG_IN_DEFAULT);
+    bsp_spk_passthrough_set_i2s_ops(NULL);
+}
+
+TEST_CASE("given real ADC capture path without source injection when paced and stopped on slow timebases then deadlines and worker stop are clean", "[tool_scope][pacing][lifecycle]")
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+    bsp_spk_passthrough_set_i2s_ops(&s_mock_scope_i2s_ops);
+    tool_scope_set_sample_source(NULL, NULL);
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_pin(BSP_PIN_ANALOG_IN_DEFAULT));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_timebase(SCOPE_TB_5MS_DIV));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_trig_mode(SCOPE_TRIG_AUTO));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_register());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(SCOPE_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_spk_passthrough_enable(true, BSP_SPK_DEFAULT_RATE_HZ));
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_set_mode(REC_MODE_USB_STUB));
+
+    /* 1. Sub-millisecond deadline pacing at 5 ms/div (target ~167 us/sample -> ~5980 Hz, 50,000 us viewport) */
+    s_mock_scope_i2s_write_calls = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_run_single_step());
+    scope_frame_t frame = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_get_latest_frame(&frame));
+    TEST_ASSERT_EQUAL(SCOPE_TB_5MS_DIV, frame.timebase);
+    TEST_ASSERT_UINT32_WITHIN(900U, 5980U, frame.sample_rate_hz);
+    TEST_ASSERT_UINT32_WITHIN(7500U, 50000U, frame.viewport_us);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, s_mock_scope_i2s_write_calls);
+
+    recorder_sink_stats_t rstats = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(frame.sample_rate_hz, rstats.last_sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(450U, rstats.last_sample_count);
+
+    /* 2. Millisecond vTaskDelay + sub-ms deadline pacing at 50 ms/div (target ~1672 us/sample -> ~598 Hz, 500,000 us viewport) */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_timebase(SCOPE_TB_50MS_DIV));
+    s_mock_scope_i2s_write_calls = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_get_latest_frame(&frame));
+    TEST_ASSERT_EQUAL(SCOPE_TB_50MS_DIV, frame.timebase);
+    TEST_ASSERT_UINT32_WITHIN(90U, 598U, frame.sample_rate_hz);
+    TEST_ASSERT_UINT32_WITHIN(75000U, 500000U, frame.viewport_us);
+    /* Slow sweep (< 4 kHz) suppresses speaker playback so it is not played back at 26x speed */
+    TEST_ASSERT_EQUAL_UINT32(0U, s_mock_scope_i2s_write_calls);
+
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(frame.sample_rate_hz, rstats.last_sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(450U, rstats.last_sample_count);
+
+    /* 3. Switch to 100 ms/div (~1.5 s full capture), let worker enter capture wait loop, then stop immediately */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_timebase(SCOPE_TB_100MS_DIV));
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    int64_t stop_start_us = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    int64_t stop_elapsed_us = esp_timer_get_time() - stop_start_us;
+    TEST_ASSERT_LESS_THAN_INT32(250000, (int32_t)stop_elapsed_us);
+    TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, SCOPE_TOOL_ID));
+
+    vTaskDelay(pdMS_TO_TICKS(40));
+    TEST_ASSERT_TRUE(heap_caps_check_integrity_all(true));
+
+    /* Verify clean restart after an aborted slow capture */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_scope_set_timebase(SCOPE_TB_1MS_DIV));
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(SCOPE_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    TEST_ASSERT_TRUE(heap_caps_check_integrity_all(true));
+
     bsp_spk_passthrough_set_i2s_ops(NULL);
 }
