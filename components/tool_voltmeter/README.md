@@ -16,7 +16,7 @@
 
 ## Internal Pipeline & Algorithms
 1. **Core 1 Batch Acquisition (`volt_c1`)**:
-   - Samples batches of `64`–`256` readings on the selected input pin using `bsp_adc1_read_raw()` and `bsp_adc1_raw_to_mv()`.
+   - Samples batches of `64`–`256` readings on the selected input pin using `bsp_adc1_read_raw()` and `bsp_adc1_raw_to_mv()`. The recorder rate is measured over the contiguous ADC reads in each batch, not taken from the speaker's nominal `16 kHz` rate.
 2. **Two-Point Linear Calibration (`voltmeter_dsp_apply_cal`)**:
    - Applies $V_{\text{cal}} = \text{slope} \cdot V_{\text{raw}} + \text{offset\_mv}$ with rail clamping to `[0, 3600] mV`.
    - Calibration parameters (`slope` in `[0.5, 2.0]`, `offset_mv` in `[-1000, +1000] mV`) are persisted per pin (`cal_g36`, `cal_g35`) in the `"volt_cal"` NVS namespace.
@@ -28,7 +28,8 @@
 5. **PSRAM Moving-Average & Session Tracker (`voltmeter_avg_filter_t`)**:
    - Maintains a circular window in PSRAM (`psram_buf_calloc`) to smooth `vavg_mv` and track session `vmin_mv`, `vmax_mv`, and `sample_count`.
 6. **Tear-Free UI & Export**:
-   - Publishes `voltmeter_frame_t` snapshots to Core 0 via `psram_double_buf_t` (`3`-slot tear-free buffer) and exports raw sample frames to `recorder_sink_push()` when recording is active.
+   - Publishes `voltmeter_frame_t` snapshots to Core 0 via `psram_double_buf_t` (`3`-slot tear-free buffer) and exports raw sample frames to `recorder_sink_push()` when recording is active. Each frame timestamp anchors its first sample; its measured `sample_rate_hz` describes only that batch.
+   - The worker pauses approximately `25 ms` between batches, so voltmeter recorder frames are discontinuous. Consumers must use each frame's timestamp to preserve the gap and must not concatenate frames as a continuous uniformly sampled signal.
 
 ---
 
