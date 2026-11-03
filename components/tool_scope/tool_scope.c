@@ -271,12 +271,7 @@ static bool should_abort_capture(uint32_t start_seq, bool is_bg_worker)
     portENTER_CRITICAL(&s_scope_lock);
     bool abort = s_stop_requested || !s_running || (s_capture_seq != start_seq) ||
                  (is_bg_worker && s_step_preempt);
-    tool_worker_t *worker = s_worker;
     portEXIT_CRITICAL(&s_scope_lock);
-
-    if (worker != NULL && tool_worker_stop_requested(worker)) {
-        return true;
-    }
     return abort;
 }
 
@@ -953,6 +948,7 @@ static esp_err_t scope_on_stop(bool keep_background, void *ctx)
     s_stop_requested = true;
     s_capture_seq++;
     tool_worker_t *worker = s_worker;
+    s_worker = NULL;
     portEXIT_CRITICAL(&s_scope_lock);
 
     if (worker != NULL) {
@@ -962,11 +958,11 @@ static esp_err_t scope_on_stop(bool keep_background, void *ctx)
         }
         if (stop_err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to stop scope worker cleanly: %s", esp_err_to_name(stop_err));
+            portENTER_CRITICAL(&s_scope_lock);
+            s_worker = worker;
+            portEXIT_CRITICAL(&s_scope_lock);
             return stop_err;
         }
-        portENTER_CRITICAL(&s_scope_lock);
-        s_worker = NULL;
-        portEXIT_CRITICAL(&s_scope_lock);
     }
 
     ensure_scope_step_mutex();
