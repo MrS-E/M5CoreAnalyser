@@ -72,13 +72,15 @@ Header: [`include/bsp_m5core2.h`](include/bsp_m5core2.h)
   - `esp_err_t bsp_pin_claim_ex(gpio_num_t pin, const char *owner_tool_id, bool require_output)`
   - `esp_err_t bsp_pin_release(gpio_num_t pin, const char *owner_tool_id)`
   - `esp_err_t bsp_pin_release_all_for_owner(const char *owner_tool_id)`
-  - `const char *bsp_pin_get_owner(gpio_num_t pin)`
+  - `esp_err_t bsp_pin_get_owner_copy(gpio_num_t pin, char *out_buf, size_t buf_len)`
+  - `bool bsp_pin_is_owned_by(gpio_num_t pin, const char *owner_tool_id)`
 - **Speaker Passthrough & DSP**:
   - `esp_err_t bsp_spk_passthrough_enable(bool enable, uint32_t sample_rate_hz)`
   - `esp_err_t bsp_spk_passthrough_set_gain(uint8_t gain_percent)`
   - `esp_err_t bsp_spk_passthrough_set_mute(bool mute)`
   - `esp_err_t bsp_spk_passthrough_push_adc12(const uint16_t *adc_samples, size_t count)`
   - `esp_err_t bsp_spk_passthrough_push_u8(const uint8_t *dac_samples, size_t count)`
+  - `size_t bsp_spk_passthrough_copy_last_pcm(int16_t *dst_pcm, size_t max_samples)`
   - `void bsp_spk_dsp_init(bsp_spk_dsp_state_t *state, uint8_t gain_percent)`
   - `void bsp_spk_dsp_process_adc12(bsp_spk_dsp_state_t *state, const uint16_t *adc_samples, int16_t *out_pcm16, size_t count)`
   - `void bsp_spk_dsp_process_u8(bsp_spk_dsp_state_t *state, const uint8_t *dac_samples, int16_t *out_pcm16, size_t count)`
