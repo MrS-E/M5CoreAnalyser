@@ -21,8 +21,10 @@
 
 static const char *TAG = "bsp_m5core2";
 
-#define FT6336U_REG_TD_STATUS       (0x02)
-#define FT6336U_I2C_TIMEOUT_MS      (30)
+#define FT6336U_REG_TD_STATUS              (0x02)
+#define FT6336U_I2C_TIMEOUT_MS             (30)
+#define ESP32_SENS_SAR_READ_CTRL_REG_ADDR  (0x3ff48800UL)
+#define ESP32_SENS_SAR_READ_CTRL_DEFAULT   (0x00090802UL)
 
 static bool s_bsp_initialized = false;
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -33,6 +35,7 @@ static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static adc_oneshot_unit_handle_t s_adc1_handle = NULL;
 static adc_cali_handle_t s_adc1_cali_handle = NULL;
 static bool s_adc1_calibrated = false;
+static bool s_adc1_hw_present = false;
 
 static esp_err_t bsp_i2c_init_internal(void)
 {
@@ -316,7 +319,16 @@ esp_err_t bsp_adc1_init(void)
     }
 #endif
 
-    ESP_LOGI(TAG, "ADC1 initialized on GPIO36 (CH0) & GPIO35 (CH7), cali=%d", (int)s_adc1_calibrated);
+    volatile uint32_t *sens_read_ctrl = (volatile uint32_t *)ESP32_SENS_SAR_READ_CTRL_REG_ADDR;
+    uint32_t ctrl_val = *sens_read_ctrl;
+    if (ctrl_val == 0U) {
+        *sens_read_ctrl = ESP32_SENS_SAR_READ_CTRL_DEFAULT;
+        ctrl_val = *sens_read_ctrl;
+    }
+    s_adc1_hw_present = (ctrl_val != 0U);
+
+    ESP_LOGI(TAG, "ADC1 initialized on GPIO36 (CH0) & GPIO35 (CH7), cali=%d, hw=%d",
+             (int)s_adc1_calibrated, (int)s_adc1_hw_present);
     return ESP_OK;
 }
 
@@ -335,6 +347,10 @@ esp_err_t bsp_adc1_read_raw(gpio_num_t pin, int *out_raw)
         if (err != ESP_OK) {
             return err;
         }
+    }
+    if (!s_adc1_hw_present) {
+        *out_raw = 2048;
+        return ESP_OK;
     }
     return adc_oneshot_read(s_adc1_handle, chan, out_raw);
 }
