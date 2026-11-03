@@ -10,6 +10,7 @@
  */
 
 #include "bsp_m5core2.h"
+#include "bsp_m5core2_priv.h"
 
 #include <limits.h>
 #include <math.h>
@@ -18,8 +19,8 @@
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/portmacro.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static const char *TAG = "bsp_spk_pass";
 
@@ -29,9 +30,9 @@ static const char *TAG = "bsp_spk_pass";
 #define BSP_SPK_MAX_RATE_HZ         (96000U)
 #define BSP_SPK_I2S_WRITE_TIMEOUT   (20U)
 
-static portMUX_TYPE s_spk_init_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static StaticSemaphore_t s_spk_mutex_buf;
 static SemaphoreHandle_t s_spk_mutex = NULL;
+static volatile int s_spk_mutex_state = 0; /* 0 = uninitialized, 1 = creating, 2 = ready */
 
 static bsp_spk_dsp_state_t s_dsp_state = {
     .prev_x = 0.0f,
@@ -51,15 +52,27 @@ static const int16_t s_silence_pcm[BSP_SPK_CHUNK_SAMPLES] = {0};
 static int16_t s_last_pcm_buf[BSP_SPK_CHUNK_SAMPLES];
 static size_t s_last_pcm_count = 0;
 
+void bsp_spk_passthrough_lock_init(void)
+{
+    if (__atomic_load_n(&s_spk_mutex_state, __ATOMIC_ACQUIRE) == 2) {
+        return;
+    }
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&s_spk_mutex_state, &expected, 1, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* Created outside any spinlock critical section */
+        s_spk_mutex = xSemaphoreCreateMutexStatic(&s_spk_mutex_buf);
+        __atomic_store_n(&s_spk_mutex_state, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&s_spk_mutex_state, __ATOMIC_ACQUIRE) != 2) {
+            vTaskDelay(1);
+        }
+    }
+}
+
 static void spk_lock(void)
 {
-    if (s_spk_mutex == NULL) {
-        portENTER_CRITICAL(&s_spk_init_spinlock);
-        if (s_spk_mutex == NULL) {
-            s_spk_mutex = xSemaphoreCreateMutexStatic(&s_spk_mutex_buf);
-        }
-        portEXIT_CRITICAL(&s_spk_init_spinlock);
-    }
+    bsp_spk_passthrough_lock_init();
     (void)xSemaphoreTake(s_spk_mutex, portMAX_DELAY);
 }
 
@@ -269,6 +282,13 @@ static const bsp_spk_i2s_ops_t *s_i2s_ops = &s_hw_i2s1_ops;
 void bsp_spk_passthrough_set_i2s_ops(const bsp_spk_i2s_ops_t *ops)
 {
     spk_lock();
+    if (s_passthrough_enabled) {
+        s_passthrough_enabled = false;
+        (void)bsp_axp192_set_speaker_enable(false);
+    }
+    if (s_i2s_ops != NULL && s_i2s_ops->disable != NULL) {
+        (void)s_i2s_ops->disable();
+    }
     s_i2s_ops = (ops != NULL) ? ops : &s_hw_i2s1_ops;
     spk_unlock();
 }
@@ -288,10 +308,10 @@ static void spk_i2s1_flush_silence_locked(void)
     }
 }
 
-static void spk_sync_amp_power_gate_locked(void)
+static esp_err_t spk_sync_amp_power_gate_locked(void)
 {
     bool amp_on = s_passthrough_enabled && (!s_dsp_state.muted) && (s_dsp_state.gain_percent > 0U);
-    (void)bsp_axp192_set_speaker_enable(amp_on);
+    return bsp_axp192_set_speaker_enable(amp_on);
 }
 
 esp_err_t bsp_spk_passthrough_enable(bool enable, uint32_t sample_rate_hz)
@@ -310,17 +330,29 @@ esp_err_t bsp_spk_passthrough_enable(bool enable, uint32_t sample_rate_hz)
         s_passthrough_enabled = false;
         bsp_spk_dsp_reset(&s_dsp_state);
         /* Gate off AXP192 SPK_EN first, then flush silence to DMA and disable I2S1 */
-        (void)bsp_axp192_set_speaker_enable(false);
+        esp_err_t gate_err = bsp_axp192_set_speaker_enable(false);
         spk_i2s1_flush_silence_locked();
+        esp_err_t i2s_err = ESP_OK;
         if (s_i2s_ops != NULL && s_i2s_ops->disable != NULL) {
-            (void)s_i2s_ops->disable();
+            i2s_err = s_i2s_ops->disable();
         }
         spk_unlock();
-        return ESP_OK;
+        return (gate_err != ESP_OK) ? gate_err : i2s_err;
     }
 
-    /* Keep speaker amplifier gated off during I2S1 init / clock reconfiguration */
-    (void)bsp_axp192_set_speaker_enable(false);
+    /* Keep speaker amplifier gated off during initial I2S1 init or sample rate change */
+    if (!s_passthrough_enabled || sample_rate_hz != s_sample_rate_hz) {
+        esp_err_t gate_off_err = bsp_axp192_set_speaker_enable(false);
+        if (gate_off_err != ESP_OK) {
+            s_passthrough_enabled = false;
+            if (s_i2s_ops != NULL && s_i2s_ops->disable != NULL) {
+                (void)s_i2s_ops->disable();
+            }
+            spk_unlock();
+            return gate_off_err;
+        }
+    }
+
     bsp_spk_dsp_reset(&s_dsp_state);
     esp_err_t err = ESP_ERR_INVALID_STATE;
     if (s_i2s_ops != NULL && s_i2s_ops->ensure_init != NULL) {
@@ -341,7 +373,16 @@ esp_err_t bsp_spk_passthrough_enable(bool enable, uint32_t sample_rate_hz)
     spk_i2s1_flush_silence_locked();
     s_sample_rate_hz = sample_rate_hz;
     s_passthrough_enabled = true;
-    spk_sync_amp_power_gate_locked();
+    esp_err_t gate_err = spk_sync_amp_power_gate_locked();
+    if (gate_err != ESP_OK) {
+        s_passthrough_enabled = false;
+        if (s_i2s_ops != NULL && s_i2s_ops->disable != NULL) {
+            (void)s_i2s_ops->disable();
+        }
+        spk_unlock();
+        return gate_err;
+    }
+
     uint8_t gain = s_dsp_state.gain_percent;
     bool muted = s_dsp_state.muted;
     spk_unlock();
@@ -376,14 +417,12 @@ esp_err_t bsp_spk_passthrough_set_gain(uint8_t gain_percent)
     }
     spk_lock();
     s_dsp_state.gain_percent = gain_percent;
+    esp_err_t gate_err = spk_sync_amp_power_gate_locked();
     if (gain_percent == 0U) {
-        spk_sync_amp_power_gate_locked();
         spk_i2s1_flush_silence_locked();
-    } else {
-        spk_sync_amp_power_gate_locked();
     }
     spk_unlock();
-    return ESP_OK;
+    return gate_err;
 }
 
 uint8_t bsp_spk_passthrough_get_gain(void)
@@ -398,14 +437,12 @@ esp_err_t bsp_spk_passthrough_set_mute(bool mute)
 {
     spk_lock();
     s_dsp_state.muted = mute;
+    esp_err_t gate_err = spk_sync_amp_power_gate_locked();
     if (mute) {
-        spk_sync_amp_power_gate_locked();
         spk_i2s1_flush_silence_locked();
-    } else {
-        spk_sync_amp_power_gate_locked();
     }
     spk_unlock();
-    return ESP_OK;
+    return gate_err;
 }
 
 bool bsp_spk_passthrough_is_muted(void)
@@ -508,13 +545,18 @@ esp_err_t bsp_spk_passthrough_push_u8(const uint8_t *dac_samples, size_t count)
     return ESP_OK;
 }
 
-const int16_t *bsp_spk_passthrough_get_last_pcm(size_t *out_samples_count)
+size_t bsp_spk_passthrough_copy_last_pcm(int16_t *dst_pcm, size_t max_samples)
 {
     spk_lock();
-    if (out_samples_count != NULL) {
-        *out_samples_count = s_last_pcm_count;
+    size_t count = s_last_pcm_count;
+    if (dst_pcm != NULL) {
+        if (count > max_samples) {
+            count = max_samples;
+        }
+        if (count > 0) {
+            memcpy(dst_pcm, s_last_pcm_buf, count * sizeof(int16_t));
+        }
     }
-    const int16_t *ptr = s_last_pcm_buf;
     spk_unlock();
-    return ptr;
+    return count;
 }

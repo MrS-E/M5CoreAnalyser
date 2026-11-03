@@ -4,6 +4,7 @@
  */
 
 #include "bsp_m5core2.h"
+#include "bsp_m5core2_priv.h"
 
 #include "driver/spi_master.h"
 #include "esp_adc/adc_cali.h"
@@ -362,6 +363,8 @@ esp_err_t bsp_adc1_raw_to_mv(gpio_num_t pin, int raw, int *out_mv)
 
 esp_err_t bsp_m5core2_init(void)
 {
+    bsp_axp192_lock_init();
+    bsp_spk_passthrough_lock_init();
     bsp_pin_manager_reset();
 
     size_t psram_size = esp_psram_get_size();

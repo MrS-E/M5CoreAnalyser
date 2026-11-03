@@ -351,10 +351,8 @@ esp_err_t bsp_adc1_raw_to_mv(gpio_num_t pin, int raw, int *out_mv);
  * GPIO Pin Reservation & Conflict Manager
  * -------------------------------------------------------------------------- */
 
-/**
- * @brief Reset all dynamic tool GPIO claims (primarily for initialization and unit testing).
- */
-void bsp_pin_manager_reset(void);
+/** Maximum length (including null terminator) of a GPIO owner tool ID string. */
+#define BSP_PIN_OWNER_MAX_LEN      (24)
 
 /**
  * @brief Check whether a GPIO is a protected internal M5Core2 pin or invalid pin.
@@ -431,14 +429,29 @@ esp_err_t bsp_pin_release(gpio_num_t pin, const char *owner_tool_id);
 esp_err_t bsp_pin_release_all_for_owner(const char *owner_tool_id);
 
 /**
- * @brief Return the current owner ID of a GPIO, or `NULL` if unclaimed.
+ * @brief Copy the current owner ID of a GPIO into a caller-provided buffer under spinlock.
  *
- * For protected system pins, returns `"system"`.
+ * For protected system pins, copies `"system"` and returns `ESP_OK`.
+ * For unclaimed user pins, writes `""` (`out_buf[0] = '\0'`) and returns `ESP_ERR_NOT_FOUND`.
  *
- * @param[in] pin Target GPIO number.
- * @return Owner string (`"system"`, tool ID, or `NULL` if free/invalid).
+ * @param[in]  pin     Target GPIO number.
+ * @param[out] out_buf Destination character buffer.
+ * @param[in]  buf_len Size of `out_buf` in bytes (must be >= 2).
+ * @return
+ *  - `ESP_OK` if the pin has an owner (copied into `out_buf`)
+ *  - `ESP_ERR_NOT_FOUND` if the pin is valid and unclaimed (`out_buf` set to empty string)
+ *  - `ESP_ERR_INVALID_ARG` if `pin` is out of range, `out_buf` is `NULL`, or `buf_len < 2`
  */
-const char *bsp_pin_get_owner(gpio_num_t pin);
+esp_err_t bsp_pin_get_owner_copy(gpio_num_t pin, char *out_buf, size_t buf_len);
+
+/**
+ * @brief Check atomically whether a GPIO is currently owned by `owner_tool_id`.
+ *
+ * @param[in] pin           Target GPIO number.
+ * @param[in] owner_tool_id Owner ID string to match (e.g. `"scope"`, `"wavegen"`, `"system"`).
+ * @return True if `pin` is currently owned by `owner_tool_id`, false otherwise.
+ */
+bool bsp_pin_is_owned_by(gpio_num_t pin, const char *owner_tool_id);
 
 /* --------------------------------------------------------------------------
  * Software-Only Analog-to-Speaker Passthrough (I2S1 + DSP Filter)
@@ -583,35 +596,16 @@ esp_err_t bsp_spk_passthrough_push_adc12(const uint16_t *adc_samples, size_t cou
 esp_err_t bsp_spk_passthrough_push_u8(const uint8_t *dac_samples, size_t count);
 
 /**
- * @brief Inspect the most recently rendered 16-bit PCM sample buffer from `bsp_spk_passthrough_push_*`.
+ * @brief Copy out the most recently rendered 16-bit PCM sample chunk from `bsp_spk_passthrough_push_*` or silence flush.
  *
- * Useful for deterministic verification of the end-to-end passthrough pipeline in tests.
+ * Thread-safe copy performed while holding the speaker passthrough mutex so cross-core callers
+ * cannot observe torn samples.
  *
- * @param[out] out_samples_count Optional pointer to receive the number of samples in the last batch.
- * @return Pointer to internal last-batch PCM buffer.
+ * @param[out] dst_pcm     Destination buffer to receive 16-bit PCM samples (may be `NULL` to query available sample count).
+ * @param[in]  max_samples Maximum number of samples to copy into `dst_pcm`.
+ * @return Number of samples copied into `dst_pcm` (or available sample count when `dst_pcm == NULL`).
  */
-const int16_t *bsp_spk_passthrough_get_last_pcm(size_t *out_samples_count);
-
-/**
- * @brief Backend I2S operations table for speaker passthrough (allows test injection of I2S errors).
- */
-typedef struct {
-    esp_err_t (*ensure_init)(uint32_t sample_rate_hz); /**< Initialize or reconfigure I2S1 clock and enable channel */
-    esp_err_t (*write_pcm)(const int16_t *pcm,
-                           size_t byte_len,
-                           size_t *out_bytes_written,
-                           uint32_t timeout_ms);       /**< Write 16-bit mono PCM samples to I2S1 DMA */
-    esp_err_t (*disable)(void);                        /**< Disable I2S1 channel when passthrough stops */
-} bsp_spk_i2s_ops_t;
-
-/**
- * @brief Override or restore the `I2S1` hardware backend used by speaker passthrough.
- *
- * Passing `NULL` restores the default `I2S_NUM_1` hardware implementation.
- *
- * @param[in] ops Pointer to custom `bsp_spk_i2s_ops_t` table, or `NULL` for default hardware `I2S1`.
- */
-void bsp_spk_passthrough_set_i2s_ops(const bsp_spk_i2s_ops_t *ops);
+size_t bsp_spk_passthrough_copy_last_pcm(int16_t *dst_pcm, size_t max_samples);
 
 #ifdef __cplusplus
 }

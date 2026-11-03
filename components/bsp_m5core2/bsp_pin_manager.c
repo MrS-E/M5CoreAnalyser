@@ -4,6 +4,7 @@
  */
 
 #include "bsp_m5core2.h"
+#include "bsp_m5core2_priv.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -12,7 +13,6 @@
 
 static const char *TAG = "bsp_pin_mgr";
 
-#define BSP_PIN_OWNER_MAX_LEN (24)
 #define BSP_SYSTEM_OWNER_NAME "system"
 
 static char s_pin_owners[GPIO_NUM_MAX][BSP_PIN_OWNER_MAX_LEN];
@@ -90,11 +90,15 @@ esp_err_t bsp_pin_claim_ex(gpio_num_t pin, const char *owner_tool_id, bool requi
     }
 
     esp_err_t ret = ESP_OK;
+    char existing_owner[BSP_PIN_OWNER_MAX_LEN] = {0};
+
     portENTER_CRITICAL(&s_pin_lock);
     if (s_pin_owners[pin][0] != '\0') {
         if (strncmp(s_pin_owners[pin], owner_tool_id, BSP_PIN_OWNER_MAX_LEN - 1) == 0) {
             ret = ESP_OK;
         } else {
+            strncpy(existing_owner, s_pin_owners[pin], BSP_PIN_OWNER_MAX_LEN - 1);
+            existing_owner[BSP_PIN_OWNER_MAX_LEN - 1] = '\0';
             ret = ESP_ERR_INVALID_STATE;
         }
     } else {
@@ -106,7 +110,7 @@ esp_err_t bsp_pin_claim_ex(gpio_num_t pin, const char *owner_tool_id, bool requi
 
     if (ret == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "GPIO%d conflict: requested by '%s', already owned by '%s'",
-                 (int)pin, owner_tool_id, bsp_pin_get_owner(pin));
+                 (int)pin, owner_tool_id, existing_owner);
     }
     return ret;
 }
@@ -159,22 +163,49 @@ esp_err_t bsp_pin_release_all_for_owner(const char *owner_tool_id)
     return ESP_OK;
 }
 
-const char *bsp_pin_get_owner(gpio_num_t pin)
+esp_err_t bsp_pin_get_owner_copy(gpio_num_t pin, char *out_buf, size_t buf_len)
 {
-    if (pin < 0 || pin >= GPIO_NUM_MAX) {
-        return NULL;
+    if (pin < 0 || pin >= GPIO_NUM_MAX || out_buf == NULL || buf_len < 2U) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     if (bsp_pin_is_protected(pin)) {
-        return BSP_SYSTEM_OWNER_NAME;
+        strncpy(out_buf, BSP_SYSTEM_OWNER_NAME, buf_len - 1U);
+        out_buf[buf_len - 1U] = '\0';
+        return ESP_OK;
     }
 
-    const char *owner = NULL;
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
     portENTER_CRITICAL(&s_pin_lock);
     if (s_pin_owners[pin][0] != '\0') {
-        owner = s_pin_owners[pin];
+        strncpy(out_buf, s_pin_owners[pin], buf_len - 1U);
+        out_buf[buf_len - 1U] = '\0';
+        ret = ESP_OK;
+    } else {
+        out_buf[0] = '\0';
     }
     portEXIT_CRITICAL(&s_pin_lock);
 
-    return owner;
+    return ret;
+}
+
+bool bsp_pin_is_owned_by(gpio_num_t pin, const char *owner_tool_id)
+{
+    if (pin < 0 || pin >= GPIO_NUM_MAX || owner_tool_id == NULL || owner_tool_id[0] == '\0') {
+        return false;
+    }
+
+    if (bsp_pin_is_protected(pin)) {
+        return (strcmp(owner_tool_id, BSP_SYSTEM_OWNER_NAME) == 0);
+    }
+
+    bool match = false;
+    portENTER_CRITICAL(&s_pin_lock);
+    if (s_pin_owners[pin][0] != '\0' &&
+        strncmp(s_pin_owners[pin], owner_tool_id, BSP_PIN_OWNER_MAX_LEN - 1) == 0) {
+        match = true;
+    }
+    portEXIT_CRITICAL(&s_pin_lock);
+
+    return match;
 }

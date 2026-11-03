@@ -6,6 +6,8 @@ idf_component_register(
         "bsp_spk_passthrough.c"
     INCLUDE_DIRS
         "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
     REQUIRES
         esp_driver_gpio
         esp_driver_i2c
