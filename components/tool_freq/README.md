@@ -30,9 +30,10 @@
    - When the `GPTimer` alarm fires (`on_gate_timer_alarm_isr`), it stops the PCNT counter in ISR context (`pcnt_unit_stop()`) and latches the stop timestamp (`s_gate_isr_stop_us`). If the task deadline expires first (or on cooperative abort), task context stops PCNT/GPTimer and computes `actual_gate_us = gate_end_us - start_us`.
    - If a slow continuous signal (`< 100 Hz`) produces 1–2 edges during a short `20 ms` gate window, `capture_freq_window()` cooperatively extends edge capture (up to `200 ms`) until the 3rd edge arrives so a full cycle is measured.
    - Switching tools (`freq_on_stop()`) or reconfiguring settings aborts any in-flight `100 ms` or `1000 ms` gate window within milliseconds and joins `freq_c1` before freeing PSRAM buffers or releasing peripherals.
-3. **5 kHz Hysteresis Crossover (`FREQ_MODE_AUTO`) & Unknown Duty in Gate-Only Mode**:
+3. **5 kHz Hysteresis Crossover (`FREQ_MODE_AUTO`) & Cross-Check Reliability**:
    - Below `5.5 kHz` (`FREQ_CROSSOVER_HIGH_HZ`), `FREQ_MODE_AUTO` uses edge-period measurement ($f = 1/T$) for high fractional frequency resolution and direct high/low pulse-width (`PW+`, `PW-`) and duty-cycle measurement.
-   - Above `5.5 kHz`, it transitions to PCNT gate counting ($f = N / t_{\text{gate}}$) and remains in gate mode until the frequency drops below `4.5 kHz` (`FREQ_CROSSOVER_LOW_HZ`).
+   - For low frequencies (`< 10 Hz`), the measurement window extends up to 2 seconds to capture complete signal periods.
+   - A cross-check between edge-period and gate-time frequency is performed (when > 10 edges are available); if the results differ by > 5%, the edge-derived duty/pulse-width metrics are marked unreliable (`duty_valid = false`, `NAN`, UI `"--"`).
    - When only PCNT gate counts are available (in `FREQ_MODE_GATE_PCNT`, or in `FREQ_MODE_AUTO` above `25 kHz` where `1 µs` software edge ISR timestamps cannot resolve pulse width), `reading.duty_valid` is set to `false`, `duty_pct`, `pulse_width_us`, and `low_width_us` are set to `NAN`, and the LVGL UI renders `"PW+: --  PW-: --"` and `"Duty: --"` instead of fabricating a 50% duty cycle.
 4. **Peripheral Error Propagation**:
    - `ensure_freq_peripherals()` and `capture_freq_window()` check and propagate all `gptimer`, `pcnt`, and `gpio` driver errors (`esp_err_t`), cleaning up partial state via `teardown_freq_peripherals()`, recording `reading.hw_error`, and displaying `"[HW ERR]"` in the UI status badge.
