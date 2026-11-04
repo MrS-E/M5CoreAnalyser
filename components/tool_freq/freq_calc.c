@@ -13,12 +13,18 @@
 
 #include "psram_buffer.h"
 
-#define FREQ_MAX_COALESCED_PULSES (256U)
+#define FREQ_MAX_ACCUM_CYCLES (128U)
 
 typedef struct {
-    uint8_t level;
-    double duration_us;
-} pulse_seg_t;
+    uint8_t state;         /* 0 = empty, 1 = accumulating seg_a, 2 = accumulating seg_b */
+    uint8_t seg_a_level;
+    uint8_t seg_b_level;
+    double seg_a_dur_us;
+    double seg_b_dur_us;
+    double sum_high_us;
+    double sum_low_us;
+    uint32_t valid_cycles;
+} pulse_cycle_accum_t;
 
 uint32_t freq_calc_gate_window_us(freq_gate_window_t gate)
 {
@@ -62,31 +68,88 @@ const char *freq_calc_mode_to_str(freq_mode_t mode)
     }
 }
 
-static void push_or_coalesce_pulse(pulse_seg_t *segs,
-                                   size_t *inout_count,
-                                   size_t max_segs,
-                                   uint8_t level,
-                                   double dur_us,
-                                   double min_glitch_us)
+static void accum_commit_pair(pulse_cycle_accum_t *acc)
 {
-    if (dur_us <= 0.0) {
+    if (acc->valid_cycles >= FREQ_MAX_ACCUM_CYCLES || acc->seg_a_level == acc->seg_b_level) {
         return;
     }
-    if (dur_us < min_glitch_us) {
-        /* Reject sub-threshold glitch pulse */
+    double high_us = (acc->seg_a_level != 0U) ? acc->seg_a_dur_us : acc->seg_b_dur_us;
+    double low_us = (acc->seg_a_level != 0U) ? acc->seg_b_dur_us : acc->seg_a_dur_us;
+    if (high_us > 0.0 && low_us > 0.0) {
+        acc->sum_high_us += high_us;
+        acc->sum_low_us += low_us;
+        acc->valid_cycles++;
+    }
+}
+
+static void accum_push_pulse(pulse_cycle_accum_t *acc,
+                             uint8_t level,
+                             double dur_us,
+                             double min_glitch_us)
+{
+    if (dur_us <= 0.0 || dur_us < min_glitch_us) {
         return;
     }
 
-    size_t n = *inout_count;
-    if (n > 0U && segs[n - 1U].level == level) {
-        segs[n - 1U].duration_us += dur_us;
+    uint8_t lvl = (uint8_t)(level & 1U);
+    if (acc->state == 0U) {
+        acc->seg_a_level = lvl;
+        acc->seg_a_dur_us = dur_us;
+        acc->state = 1U;
+    } else if (acc->state == 1U) {
+        if (lvl == acc->seg_a_level) {
+            acc->seg_a_dur_us += dur_us;
+        } else {
+            acc->seg_b_level = lvl;
+            acc->seg_b_dur_us = dur_us;
+            acc->state = 2U;
+        }
+    } else {
+        if (lvl == acc->seg_b_level) {
+            acc->seg_b_dur_us += dur_us;
+        } else {
+            accum_commit_pair(acc);
+            acc->seg_a_level = lvl;
+            acc->seg_a_dur_us = dur_us;
+            acc->state = 1U;
+        }
+    }
+}
+
+static void accum_finalize(pulse_cycle_accum_t *acc, freq_period_result_t *out_result)
+{
+    if (acc->state == 2U) {
+        accum_commit_pair(acc);
+        acc->state = 0U;
+    }
+
+    if (acc->valid_cycles == 0U) {
         return;
     }
-    if (n < max_segs) {
-        segs[n].level = level;
-        segs[n].duration_us = dur_us;
-        *inout_count = n + 1U;
+
+    double avg_high_us = acc->sum_high_us / (double)acc->valid_cycles;
+    double avg_low_us = acc->sum_low_us / (double)acc->valid_cycles;
+    double avg_period_us = avg_high_us + avg_low_us;
+    if (avg_period_us <= 0.0) {
+        return;
     }
+
+    double freq_hz = 1000000.0 / avg_period_us;
+    double duty_pct = (avg_high_us * 100.0) / avg_period_us;
+    if (duty_pct < 0.0) {
+        duty_pct = 0.0;
+    } else if (duty_pct > 100.0) {
+        duty_pct = 100.0;
+    }
+
+    out_result->valid = true;
+    out_result->freq_hz = (float)freq_hz;
+    out_result->period_us = (float)avg_period_us;
+    out_result->pulse_width_us = (float)avg_high_us;
+    out_result->low_width_us = (float)avg_low_us;
+    out_result->duty_pct = (float)duty_pct;
+    out_result->rpm = (float)(freq_hz * 60.0);
+    out_result->cycles_measured = acc->valid_cycles;
 }
 
 esp_err_t freq_calc_from_rmt_symbols(const rmt_symbol_word_t *symbols,
@@ -107,8 +170,7 @@ esp_err_t freq_calc_from_rmt_symbols(const rmt_symbol_word_t *symbols,
     const double tick_to_us = 1000000.0 / (double)resolution_hz;
     const double min_glitch_us = (double)min_glitch_ns / 1000.0;
 
-    pulse_seg_t segs[FREQ_MAX_COALESCED_PULSES];
-    size_t seg_count = 0U;
+    pulse_cycle_accum_t acc = {0};
 
     for (size_t i = 0; i < num_symbols; ++i) {
         uint16_t d0 = symbols[i].duration0;
@@ -119,68 +181,53 @@ esp_err_t freq_calc_from_rmt_symbols(const rmt_symbol_word_t *symbols,
         if (d0 == 0U) {
             break;
         }
-        push_or_coalesce_pulse(
-            segs, &seg_count, FREQ_MAX_COALESCED_PULSES, (uint8_t)(l0 & 1U), (double)d0 * tick_to_us, min_glitch_us);
+        accum_push_pulse(&acc, (uint8_t)(l0 & 1U), (double)d0 * tick_to_us, min_glitch_us);
 
         if (d1 == 0U) {
             break;
         }
-        push_or_coalesce_pulse(
-            segs, &seg_count, FREQ_MAX_COALESCED_PULSES, (uint8_t)(l1 & 1U), (double)d1 * tick_to_us, min_glitch_us);
+        accum_push_pulse(&acc, (uint8_t)(l1 & 1U), (double)d1 * tick_to_us, min_glitch_us);
     }
 
-    size_t num_cycles = seg_count / 2U;
-    if (num_cycles == 0U) {
+    accum_finalize(&acc, out_result);
+    return ESP_OK;
+}
+
+esp_err_t freq_calc_from_edge_timestamps(const freq_edge_stamp_t *edges,
+                                         size_t num_edges,
+                                         uint32_t min_glitch_ns,
+                                         freq_period_result_t *out_result)
+{
+    if (out_result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_result, 0, sizeof(*out_result));
+
+    if (edges == NULL || num_edges < 3U) {
         return ESP_OK;
     }
 
-    double sum_high_us = 0.0;
-    double sum_low_us = 0.0;
-    uint32_t valid_cycles = 0U;
+    const double min_glitch_us = (double)min_glitch_ns / 1000.0;
+    pulse_cycle_accum_t acc = {0};
 
-    for (size_t c = 0; c < num_cycles; ++c) {
-        const pulse_seg_t *a = &segs[2U * c];
-        const pulse_seg_t *b = &segs[2U * c + 1U];
-        if (a->level == b->level) {
+    for (size_t i = 0; i + 1U < num_edges; ++i) {
+        if (edges[i + 1U].timestamp_us <= edges[i].timestamp_us) {
             continue;
         }
-        double high_us = (a->level != 0U) ? a->duration_us : b->duration_us;
-        double low_us = (a->level != 0U) ? b->duration_us : a->duration_us;
-        if (high_us > 0.0 && low_us > 0.0) {
-            sum_high_us += high_us;
-            sum_low_us += low_us;
-            valid_cycles++;
-        }
+        double dur_us = (double)(edges[i + 1U].timestamp_us - edges[i].timestamp_us);
+        accum_push_pulse(&acc, (uint8_t)(edges[i].level & 1U), dur_us, min_glitch_us);
     }
 
-    if (valid_cycles == 0U) {
-        return ESP_OK;
-    }
-
-    double avg_high_us = sum_high_us / (double)valid_cycles;
-    double avg_low_us = sum_low_us / (double)valid_cycles;
-    double avg_period_us = avg_high_us + avg_low_us;
-    if (avg_period_us <= 0.0) {
-        return ESP_OK;
-    }
-
-    double freq_hz = 1000000.0 / avg_period_us;
-    double duty_pct = (avg_high_us * 100.0) / avg_period_us;
-    if (duty_pct < 0.0) {
-        duty_pct = 0.0;
-    } else if (duty_pct > 100.0) {
-        duty_pct = 100.0;
-    }
-
-    out_result->valid = true;
-    out_result->freq_hz = (float)freq_hz;
-    out_result->period_us = (float)avg_period_us;
-    out_result->pulse_width_us = (float)avg_high_us;
-    out_result->low_width_us = (float)avg_low_us;
-    out_result->duty_pct = (float)duty_pct;
-    out_result->rpm = (float)(freq_hz * 60.0);
-    out_result->cycles_measured = valid_cycles;
+    accum_finalize(&acc, out_result);
     return ESP_OK;
+}
+
+float freq_calc_pcnt_max_freq_hz(uint32_t glitch_ns)
+{
+    if (glitch_ns == 0U) {
+        return 40000000.0f; /* 80 MHz APB Nyquist */
+    }
+    return 1000000000.0f / (2.0f * (float)glitch_ns);
 }
 
 esp_err_t freq_calc_from_gate_counts(uint64_t pulse_count,
@@ -338,9 +385,11 @@ esp_err_t freq_calc_combine_reading(freq_mode_t mode,
 
     freq_method_t method = freq_calc_select_method(mode, prev_method, period_res, gate_res);
     out_reading->active_method = method;
+    out_reading->hw_error = ESP_OK;
 
     if (method == FREQ_METHOD_PERIOD && period_res != NULL && period_res->valid) {
         out_reading->signal_detected = true;
+        out_reading->duty_valid = true;
         out_reading->freq_hz = period_res->freq_hz;
         out_reading->period_us = period_res->period_us;
         out_reading->pulse_width_us = period_res->pulse_width_us;
@@ -362,17 +411,23 @@ esp_err_t freq_calc_combine_reading(freq_mode_t mode,
         out_reading->gate_duration_us = gate_res->gate_duration_us;
 
         if (period_res != NULL && period_res->valid) {
+            out_reading->duty_valid = true;
             out_reading->duty_pct = period_res->duty_pct;
             out_reading->pulse_width_us = out_reading->period_us * (period_res->duty_pct / 100.0f);
             out_reading->low_width_us = out_reading->period_us - out_reading->pulse_width_us;
         } else {
-            out_reading->duty_pct = 50.0f;
-            out_reading->pulse_width_us = out_reading->period_us * 0.5f;
-            out_reading->low_width_us = out_reading->period_us * 0.5f;
+            out_reading->duty_valid = false;
+            out_reading->duty_pct = NAN;
+            out_reading->pulse_width_us = NAN;
+            out_reading->low_width_us = NAN;
         }
     } else {
         out_reading->signal_detected = false;
+        out_reading->duty_valid = false;
         out_reading->active_method = FREQ_METHOD_NONE;
+        out_reading->duty_pct = NAN;
+        out_reading->pulse_width_us = NAN;
+        out_reading->low_width_us = NAN;
         if (gate_res != NULL) {
             out_reading->gate_duration_us = gate_res->gate_duration_us;
         }

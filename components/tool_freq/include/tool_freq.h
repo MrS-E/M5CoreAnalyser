@@ -2,10 +2,11 @@
  * @file tool_freq.h
  * @brief Digital Frequency Meter instrument component (`tool_freq`) for M5CoreAnalyser.
  *
- * Combines low-frequency edge-period measurement (\f$ f = 1/T \f$ via ESP32 RMT RX + GPTimer)
- * and high-frequency gate-time pulse counting (\f$ f = N / t_{\text{gate}} \f$ via ESP32 PCNT + GPTimer)
- * with automatic hysteresis crossover around `5 kHz`. Reports frequency (`Hz`/`kHz`/`MHz`),
- * period, high/low pulse widths, duty cycle, RPM, and session min/max/average statistics.
+ * Combines low-frequency edge-period measurement (\f$ f = 1/T \f$ via GPIO edge ISR timestamps
+ * in internal SRAM or RMT RX symbols) and high-frequency gate-time pulse counting
+ * (\f$ f = N / t_{\text{gate}} \f$ via ESP32 PCNT + GPTimer) with automatic hysteresis crossover
+ * around `5 kHz`. Reports frequency (`Hz`/`kHz`/`MHz`), period, high/low pulse widths, duty cycle
+ * (or unknown/`NaN` when only gate counts exist), RPM, and session min/max/average statistics.
  */
 
 #pragma once
@@ -28,33 +29,50 @@ extern "C" {
  *  @{
  */
 #define FREQ_TOOL_ID                    "freq"
-#define FREQ_RMT_RESOLUTION_HZ          (1000000U)  /**< 1 MHz (1 us per tick) RMT RX resolution */
+#define FREQ_RMT_RESOLUTION_HZ          (1000000U)  /**< 1 MHz (1 us per tick) symbol/timestamp resolution */
 #define FREQ_GPTIMER_RESOLUTION_HZ      (1000000U)  /**< 1 MHz (1 us per tick) GPTimer gate resolution */
-#define FREQ_DEFAULT_GLITCH_NS          (1000U)     /**< 1 us default glitch filter threshold */
+#define FREQ_PERIOD_DEFAULT_GLITCH_NS   (1000U)     /**< 1 us default glitch rejection for low-freq 1/T period mode */
+#define FREQ_DEFAULT_GLITCH_NS          FREQ_PERIOD_DEFAULT_GLITCH_NS /**< Backwards-compatible alias for 1/T glitch threshold */
+#define FREQ_PCNT_DEFAULT_GLITCH_NS     (25U)       /**< 25 ns (2 APB cycles @ 80 MHz) PCNT filter; allows up to 20 MHz @ 50% duty */
+#define FREQ_PCNT_MAX_GLITCH_NS         (12500U)    /**< Maximum configurable PCNT hardware glitch filter (1000 APB ticks) */
 #define FREQ_PCNT_HIGH_LIMIT            (30000)     /**< PCNT 16-bit watch point for overflow accumulation */
 #define FREQ_PCNT_LOW_LIMIT             (-30000)
 #define FREQ_CROSSOVER_NOMINAL_HZ       (5000.0f)   /**< Nominal 5 kHz period-to-gate crossover frequency */
 #define FREQ_CROSSOVER_LOW_HZ           (4500.0f)   /**< Switch from GATE back to PERIOD below 4.5 kHz */
 #define FREQ_CROSSOVER_HIGH_HZ          (5500.0f)   /**< Switch from PERIOD to GATE above 5.5 kHz */
+#define FREQ_MAX_EDGE_DUTY_HZ           (25000.0f)  /**< Max frequency where 1 us GPIO ISR timestamps supply duty in AUTO mode */
 #define FREQ_SESSION_AVG_WINDOW         (16U)       /**< PSRAM session moving-average window length */
-#define FREQ_RMT_BOUNCE_SYMBOLS         (64U)       /**< Internal SRAM bounce buffer symbol count for RMT RX ISR */
+#define FREQ_EDGE_RING_CAPACITY         (128U)      /**< Internal SRAM ISR ring capacity for GPIO edge timestamps (64 cycles) */
+#define FREQ_RMT_BOUNCE_SYMBOLS         (64U)       /**< Internal SRAM symbol capacity */
+#define FREQ_WORKER_STACK_BYTES         (6144U)     /**< Core 1 `freq_c1` worker task stack size in bytes */
 
 #if CONFIG_SPIRAM
-#define FREQ_PSRAM_SYMBOL_BUF_CAP       (1024U)     /**< PSRAM staging capacity for captured RMT symbols */
+#define FREQ_PSRAM_SYMBOL_BUF_CAP       (1024U)     /**< PSRAM staging capacity for captured symbols/edges */
 #else
 #define FREQ_PSRAM_SYMBOL_BUF_CAP       (128U)      /**< Compact staging capacity for PSRAM-less QEMU */
 #endif
 /** @} */
 
 /**
+ * @brief Single GPIO edge timestamp sample captured by the `IRAM_ATTR` GPIO ISR into internal SRAM.
+ */
+typedef struct {
+    uint64_t timestamp_us; /**< Edge timestamp in microseconds from `esp_timer_get_time()` */
+    uint8_t level;         /**< GPIO logic level (`0` or `1`) immediately after the edge transition */
+} freq_edge_stamp_t;
+
+/**
  * @brief User-selectable Frequency Meter operating mode.
  */
 typedef enum {
     FREQ_MODE_AUTO = 0,       /**< Automatic hysteresis crossover between Period (<5kHz) and Gate (>=5kHz) */
-    FREQ_MODE_PERIOD_RMT,     /**< Forced low-frequency period measurement (f = 1/T via RMT RX) */
+    FREQ_MODE_PERIOD_RMT,     /**< Forced low-frequency period measurement (f = 1/T via edge timestamps / symbols) */
     FREQ_MODE_GATE_PCNT,      /**< Forced high-frequency gate-time pulse counting (f = N/t_gate via PCNT) */
     FREQ_MODE_COUNT
 } freq_mode_t;
+
+/** Alias for `FREQ_MODE_PERIOD_RMT` reflecting continuous GPIO edge timestamp period measurement. */
+#define FREQ_MODE_PERIOD_EDGE FREQ_MODE_PERIOD_RMT
 
 /**
  * @brief Active underlying frequency measurement method used for a reading.
@@ -114,12 +132,14 @@ typedef struct {
  */
 typedef struct {
     bool signal_detected;     /**< True if a periodic signal was detected in the current window */
+    bool duty_valid;          /**< True if pulse_width_us, low_width_us, and duty_pct were measured; false (NaN) when only gate counts exist */
     freq_method_t active_method; /**< Active measurement method (`PERIOD`, `GATE`, or `NONE`) */
+    esp_err_t hw_error;       /**< `ESP_OK` on normal operation, or ESP-IDF driver error if peripheral setup/capture failed */
     float freq_hz;            /**< Primary measured frequency in Hz (0.0f on timeout) */
     float period_us;          /**< Measured signal period in microseconds (0.0f on timeout) */
-    float pulse_width_us;     /**< High pulse width in microseconds (from RMT RX or duty estimate) */
-    float low_width_us;       /**< Low pulse width in microseconds */
-    float duty_pct;           /**< Positive duty cycle in percent (0.0f..100.0f) */
+    float pulse_width_us;     /**< High pulse width in microseconds (`NAN` when `duty_valid == false`) */
+    float low_width_us;       /**< Low pulse width in microseconds (`NAN` when `duty_valid == false`) */
+    float duty_pct;           /**< Positive duty cycle in percent (`0.0f..100.0f`, or `NAN` when `duty_valid == false`) */
     float rpm;                /**< Revolutions per minute (60.0f * freq_hz) */
     uint64_t edge_count;      /**< Pulse/edge count observed in the active window */
     uint64_t gate_duration_us;/**< Elapsed measurement gate duration in microseconds */
@@ -203,6 +223,36 @@ esp_err_t freq_calc_from_rmt_symbols(const rmt_symbol_word_t *symbols,
                                      uint32_t resolution_hz,
                                      uint32_t min_glitch_ns,
                                      freq_period_result_t *out_result);
+
+/**
+ * @brief Compute period, frequency (`f = 1/T`), high/low pulse widths, duty cycle, and RPM
+ *        from continuous GPIO edge ISR timestamps captured in internal SRAM.
+ *
+ * Works on continuous periodic signals without requiring an RMT idle timeout. Intervals
+ * narrower than `min_glitch_ns` are rejected and adjacent same-level intervals are coalesced
+ * in a single stack-free pass.
+ *
+ * @param[in]  edges          Array of `freq_edge_stamp_t` edge timestamps (`num_edges >= 3` for 1 full cycle).
+ * @param[in]  num_edges      Number of captured edges in `edges`.
+ * @param[in]  min_glitch_ns  Minimum valid pulse duration in nanoseconds (e.g. `1000` ns; `0` = no filter).
+ * @param[out] out_result     Destination period measurement result.
+ * @return `ESP_OK` on success (check `out_result->valid`), `ESP_ERR_INVALID_ARG` if `out_result == NULL`.
+ */
+esp_err_t freq_calc_from_edge_timestamps(const freq_edge_stamp_t *edges,
+                                         size_t num_edges,
+                                         uint32_t min_glitch_ns,
+                                         freq_period_result_t *out_result);
+
+/**
+ * @brief Return the maximum 50%-duty signal frequency in Hz permitted by a PCNT glitch filter setting.
+ *
+ * At `glitch_ns == 25` (2 APB cycles @ 80 MHz), returns `20,000,000.0f` (`20 MHz`).
+ * At `glitch_ns == 0` (filter disabled), returns `40,000,000.0f` (80 MHz APB Nyquist).
+ *
+ * @param[in] glitch_ns PCNT glitch filter threshold in nanoseconds.
+ * @return Maximum unattenuated 50%-duty frequency in Hz.
+ */
+float freq_calc_pcnt_max_freq_hz(uint32_t glitch_ns);
 
 /**
  * @brief Compute frequency (`f = N / t_gate`), period, and RPM from PCNT pulse count and GPTimer gate duration.
@@ -362,6 +412,24 @@ esp_err_t tool_freq_set_gate_window(freq_gate_window_t gate);
  * @return Current `freq_gate_window_t`.
  */
 freq_gate_window_t tool_freq_get_gate_window(void);
+
+/**
+ * @brief Set the PCNT hardware glitch filter threshold in nanoseconds (`0` to disable, up to `FREQ_PCNT_MAX_GLITCH_NS`).
+ *
+ * Defaults to `FREQ_PCNT_DEFAULT_GLITCH_NS` (`25 ns` = 2 APB cycles @ 80 MHz), which filters
+ * single-cycle metastability spikes while permitting multi-MHz signals up to `20 MHz` at 50% duty.
+ *
+ * @param[in] max_glitch_ns Glitch filter threshold in nanoseconds (`0..12500`).
+ * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` if `max_glitch_ns > FREQ_PCNT_MAX_GLITCH_NS`.
+ */
+esp_err_t tool_freq_set_pcnt_glitch_ns(uint32_t max_glitch_ns);
+
+/**
+ * @brief Get the currently configured PCNT hardware glitch filter threshold in nanoseconds.
+ *
+ * @return Glitch filter threshold in nanoseconds (`25` by default).
+ */
+uint32_t tool_freq_get_pcnt_glitch_ns(void);
 
 /**
  * @brief Pause or resume frequency measurement updates (`HOLD` / `RUN`).

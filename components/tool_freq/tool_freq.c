@@ -1,8 +1,8 @@
 /**
  * @file tool_freq.c
- * @brief Core 1 Frequency Meter worker (RMT RX + PCNT + GPTimer), internal SRAM ISR bounce
- *        buffers, PSRAM staging and double-buffer handoff, recorder sink integration, and
- *        LVGL 9 UI for `tool_freq`.
+ * @brief Core 1 Frequency Meter worker (GPIO edge ISR timestamps + PCNT + GPTimer), internal SRAM
+ *        ISR bounce buffers, PSRAM staging and double-buffer handoff, recorder sink integration,
+ *        and LVGL 9 UI for `tool_freq`.
  */
 
 #include "tool_freq.h"
@@ -18,7 +18,6 @@
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "driver/pulse_cnt.h"
-#include "driver/rmt_rx.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -28,6 +27,7 @@
 #include "lvgl.h"
 #include "psram_buffer.h"
 #include "recorder_sink.h"
+#include "soc/gpio_struct.h"
 #include "tool_core.h"
 
 static const char *TAG = "tool_freq";
@@ -35,6 +35,7 @@ static const char *TAG = "tool_freq";
 #define FREQ_WORKER_PERIOD_MS       (20)
 #define FREQ_WORKER_STOP_WAIT_MS    (2000)
 #define FREQ_WORKER_STOP_RETRIES    (5)
+#define FREQ_SLOW_PERIOD_EXTEND_US  (200000ULL) /**< Max cooperative extension when 1..2 slow edges seen in short gate */
 
 static const gpio_num_t s_supported_pins[] = {
     BSP_PIN_ANALOG_IN_DEFAULT, /* GPIO36 (Port B / M5-Bus default) */
@@ -57,31 +58,38 @@ static atomic_int s_step_mutex_state = 0;
 static gpio_num_t s_selected_pin = BSP_PIN_ANALOG_IN_DEFAULT;
 static freq_mode_t s_mode = FREQ_MODE_AUTO;
 static freq_gate_window_t s_gate_window = FREQ_GATE_100MS;
+static uint32_t s_pcnt_glitch_ns = FREQ_PCNT_DEFAULT_GLITCH_NS;
 static bool s_running = true;
 static bool s_tool_active = false;
 static bool s_reset_requested = false;
 static volatile bool s_stop_requested = false;
 static volatile bool s_step_preempt = false;
 static volatile uint32_t s_capture_seq = 0;
+static esp_err_t s_injected_driver_err = ESP_OK;
+static uint32_t s_worker_min_stack_hwm_bytes = 0U;
+static uint32_t s_worker_completed_steps = 0U;
 
 /* Internal SRAM ISR bounce buffers & state (never in PSRAM) */
-static DRAM_ATTR rmt_symbol_word_t s_rmt_bounce_buf[FREQ_RMT_BOUNCE_SYMBOLS];
-static DRAM_ATTR volatile size_t s_rmt_isr_symbol_count = 0;
-static DRAM_ATTR volatile bool s_rmt_isr_done = false;
+static DRAM_ATTR freq_edge_stamp_t s_edge_bounce_buf[FREQ_EDGE_RING_CAPACITY];
+static DRAM_ATTR volatile size_t s_edge_isr_count = 0;
+static DRAM_ATTR volatile bool s_edge_capture_active = false;
 static DRAM_ATTR volatile int64_t s_pcnt_overflow_accum = 0;
+static DRAM_ATTR volatile bool s_pcnt_gate_running = false;
 static DRAM_ATTR volatile bool s_gate_alarm_fired = false;
+static DRAM_ATTR volatile int64_t s_gate_isr_stop_us = 0;
 
 /* Hardware peripheral handles */
 static gpio_num_t s_hw_configured_pin = GPIO_NUM_NC;
+static uint32_t s_hw_configured_glitch_ns = UINT32_MAX;
 static pcnt_unit_handle_t s_pcnt_unit = NULL;
 static pcnt_channel_handle_t s_pcnt_chan = NULL;
-static rmt_channel_handle_t s_rmt_chan = NULL;
-static bool s_rmt_enabled = false;
 static gptimer_handle_t s_gptimer = NULL;
 static bool s_gptimer_enabled = false;
+static bool s_gpio_isr_registered = false;
 
 /* PSRAM buffers & state */
 static rmt_symbol_word_t *s_psram_symbols = NULL;
+static freq_edge_stamp_t *s_psram_edges = NULL;
 static freq_session_tracker_t s_tracker = {0};
 static psram_double_buf_t s_frame_dbuf = {0};
 static freq_reading_t s_latest_reading = {0};
@@ -211,6 +219,28 @@ freq_gate_window_t tool_freq_get_gate_window(void)
     return gate;
 }
 
+esp_err_t tool_freq_set_pcnt_glitch_ns(uint32_t max_glitch_ns)
+{
+    if (max_glitch_ns > FREQ_PCNT_MAX_GLITCH_NS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_freq_lock);
+    if (s_pcnt_glitch_ns != max_glitch_ns) {
+        s_pcnt_glitch_ns = max_glitch_ns;
+        s_capture_seq++;
+    }
+    portEXIT_CRITICAL(&s_freq_lock);
+    return ESP_OK;
+}
+
+uint32_t tool_freq_get_pcnt_glitch_ns(void)
+{
+    portENTER_CRITICAL(&s_freq_lock);
+    uint32_t glitch_ns = s_pcnt_glitch_ns;
+    portEXIT_CRITICAL(&s_freq_lock);
+    return glitch_ns;
+}
+
 esp_err_t tool_freq_set_running(bool running)
 {
     portENTER_CRITICAL(&s_freq_lock);
@@ -262,27 +292,89 @@ void tool_freq_set_capture_source(freq_capture_source_fn_t fn, void *user_ctx)
     portEXIT_CRITICAL(&s_freq_lock);
 }
 
+void tool_freq_set_driver_error_for_test(esp_err_t err)
+{
+    portENTER_CRITICAL(&s_freq_lock);
+    s_injected_driver_err = err;
+    s_capture_seq++;
+    portEXIT_CRITICAL(&s_freq_lock);
+}
+
+uint32_t tool_freq_get_worker_stack_hwm_bytes(void)
+{
+    portENTER_CRITICAL(&s_freq_lock);
+    uint32_t hwm = s_worker_min_stack_hwm_bytes;
+    portEXIT_CRITICAL(&s_freq_lock);
+    return hwm;
+}
+
+uint32_t tool_freq_get_worker_completed_steps(void)
+{
+    portENTER_CRITICAL(&s_freq_lock);
+    uint32_t steps = s_worker_completed_steps;
+    portEXIT_CRITICAL(&s_freq_lock);
+    return steps;
+}
+
 /* --------------------------------------------------------------------------
  * Hardware ISR Callbacks (Internal SRAM Only)
  * -------------------------------------------------------------------------- */
 
-static bool IRAM_ATTR on_rmt_rx_done_isr(rmt_channel_handle_t channel,
-                                         const rmt_rx_done_event_data_t *edata,
-                                         void *user_data)
+static inline uint8_t IRAM_ATTR read_pin_level_iram(int pin)
 {
-    (void)channel;
-    (void)user_data;
-    if (edata != NULL) {
-        size_t n = edata->num_symbols;
-        if (n > FREQ_RMT_BOUNCE_SYMBOLS) {
-            n = FREQ_RMT_BOUNCE_SYMBOLS;
+    if (pin < 32) {
+        uint32_t mask = (1UL << (uint32_t)pin);
+        uint32_t in_bit = (GPIO.in & mask) ? 1U : 0U;
+        if ((GPIO.enable & mask) != 0U) {
+            uint32_t out_bit = (GPIO.out & mask) ? 1U : 0U;
+            return (uint8_t)(in_bit | out_bit);
         }
-        s_rmt_isr_symbol_count = n;
+        return (uint8_t)in_bit;
     } else {
-        s_rmt_isr_symbol_count = 0U;
+        uint32_t shift = (uint32_t)(pin - 32);
+        return (uint8_t)((GPIO.in1.val >> shift) & 0x1U);
     }
-    s_rmt_isr_done = true;
-    return false;
+}
+
+static void IRAM_ATTR record_edge_sample_iram(uint64_t now_us, uint8_t level, gpio_num_t pin)
+{
+    if (!s_edge_capture_active) {
+        return;
+    }
+    uint8_t lvl = (uint8_t)(level & 1U);
+    size_t idx = s_edge_isr_count;
+    if (idx > 0U && s_edge_bounce_buf[idx - 1U].level == lvl) {
+        return;
+    }
+    if (idx < FREQ_EDGE_RING_CAPACITY) {
+        s_edge_bounce_buf[idx].timestamp_us = now_us;
+        s_edge_bounce_buf[idx].level = lvl;
+        idx++;
+        s_edge_isr_count = idx;
+        if (idx >= FREQ_EDGE_RING_CAPACITY) {
+            s_edge_capture_active = false;
+            (void)gpio_intr_disable(pin);
+        }
+    }
+}
+
+static void IRAM_ATTR on_freq_gpio_edge_isr(void *arg)
+{
+    int pin = (int)(intptr_t)arg;
+    if (!s_edge_capture_active) {
+        return;
+    }
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    uint8_t lvl = read_pin_level_iram(pin);
+    record_edge_sample_iram(now_us, lvl, (gpio_num_t)pin);
+}
+
+void IRAM_ATTR tool_freq_record_edge_isr_for_test(gpio_num_t pin, uint64_t timestamp_us, uint8_t level)
+{
+    if (pin != s_hw_configured_pin) {
+        return;
+    }
+    record_edge_sample_iram(timestamp_us, level, pin);
 }
 
 static bool IRAM_ATTR on_pcnt_watch_reach_isr(pcnt_unit_handle_t unit,
@@ -304,16 +396,31 @@ static bool IRAM_ATTR on_gate_timer_alarm_isr(gptimer_handle_t timer,
     (void)timer;
     (void)edata;
     (void)user_ctx;
+    if (s_pcnt_unit != NULL && s_pcnt_gate_running) {
+        (void)pcnt_unit_stop(s_pcnt_unit);
+        s_pcnt_gate_running = false;
+    }
+    s_gate_isr_stop_us = esp_timer_get_time();
     s_gate_alarm_fired = true;
     return false;
 }
 
 /* --------------------------------------------------------------------------
- * Hardware Peripheral Setup & Teardown (RMT RX + PCNT + GPTimer)
+ * Hardware Peripheral Setup & Teardown (GPIO Edge ISR + PCNT + GPTimer)
  * -------------------------------------------------------------------------- */
 
 static void teardown_freq_peripherals(void)
 {
+    s_edge_capture_active = false;
+    s_pcnt_gate_running = false;
+
+    if (s_gpio_isr_registered && s_hw_configured_pin != GPIO_NUM_NC) {
+        (void)gpio_intr_disable(s_hw_configured_pin);
+        (void)gpio_isr_handler_remove(s_hw_configured_pin);
+        (void)gpio_set_intr_type(s_hw_configured_pin, GPIO_INTR_DISABLE);
+        s_gpio_isr_registered = false;
+    }
+
     if (s_gptimer != NULL) {
         if (s_gptimer_enabled) {
             (void)gptimer_stop(s_gptimer);
@@ -322,15 +429,6 @@ static void teardown_freq_peripherals(void)
         }
         (void)gptimer_del_timer(s_gptimer);
         s_gptimer = NULL;
-    }
-
-    if (s_rmt_chan != NULL) {
-        if (s_rmt_enabled) {
-            (void)rmt_disable(s_rmt_chan);
-            s_rmt_enabled = false;
-        }
-        (void)rmt_del_channel(s_rmt_chan);
-        s_rmt_chan = NULL;
     }
 
     if (s_pcnt_chan != NULL) {
@@ -345,77 +443,152 @@ static void teardown_freq_peripherals(void)
     }
 
     s_hw_configured_pin = GPIO_NUM_NC;
+    s_hw_configured_glitch_ns = UINT32_MAX;
 }
 
-static esp_err_t ensure_freq_peripherals(gpio_num_t pin)
+static esp_err_t ensure_freq_peripherals(gpio_num_t pin, uint32_t glitch_ns)
 {
-    if (s_hw_configured_pin == pin && s_pcnt_unit != NULL && s_gptimer != NULL) {
+    portENTER_CRITICAL(&s_freq_lock);
+    esp_err_t injected_err = s_injected_driver_err;
+    portEXIT_CRITICAL(&s_freq_lock);
+    if (injected_err != ESP_OK) {
+        teardown_freq_peripherals();
+        return injected_err;
+    }
+
+    if (s_hw_configured_pin == pin &&
+        s_hw_configured_glitch_ns == glitch_ns &&
+        s_pcnt_unit != NULL &&
+        s_gptimer != NULL &&
+        s_gpio_isr_registered) {
         return ESP_OK;
     }
 
     teardown_freq_peripherals();
 
-    /* 1. Configure GPTimer at 1 MHz resolution for gate window timing */
+    /* 1. Configure GPTimer at 1 MHz resolution for hardware gate window timing */
     gptimer_config_t tcfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = FREQ_GPTIMER_RESOLUTION_HZ,
     };
-    if (gptimer_new_timer(&tcfg, &s_gptimer) == ESP_OK && s_gptimer != NULL) {
-        gptimer_event_callbacks_t tcbs = {
-            .on_alarm = on_gate_timer_alarm_isr,
-        };
-        (void)gptimer_register_event_callbacks(s_gptimer, &tcbs, NULL);
-        if (gptimer_enable(s_gptimer) == ESP_OK) {
-            s_gptimer_enabled = true;
-        }
+    esp_err_t err = gptimer_new_timer(&tcfg, &s_gptimer);
+    if (err != ESP_OK || s_gptimer == NULL) {
+        ESP_LOGE(TAG, "gptimer_new_timer failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return (err != ESP_OK) ? err : ESP_FAIL;
     }
+
+    gptimer_event_callbacks_t tcbs = {
+        .on_alarm = on_gate_timer_alarm_isr,
+    };
+    err = gptimer_register_event_callbacks(s_gptimer, &tcbs, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gptimer_register_event_callbacks failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+    err = gptimer_enable(s_gptimer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gptimer_enable failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+    s_gptimer_enabled = true;
 
     /* 2. Configure PCNT unit & channel on `pin` (both rising & falling edges -> 2x resolution) */
     pcnt_unit_config_t ucfg = {
         .low_limit = FREQ_PCNT_LOW_LIMIT,
         .high_limit = FREQ_PCNT_HIGH_LIMIT,
     };
-    if (pcnt_new_unit(&ucfg, &s_pcnt_unit) == ESP_OK && s_pcnt_unit != NULL) {
+    err = pcnt_new_unit(&ucfg, &s_pcnt_unit);
+    if (err != ESP_OK || s_pcnt_unit == NULL) {
+        ESP_LOGE(TAG, "pcnt_new_unit failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return (err != ESP_OK) ? err : ESP_FAIL;
+    }
+
+    if (glitch_ns > 0U) {
         pcnt_glitch_filter_config_t fcfg = {
-            .max_glitch_ns = FREQ_DEFAULT_GLITCH_NS,
+            .max_glitch_ns = glitch_ns,
         };
-        (void)pcnt_unit_set_glitch_filter(s_pcnt_unit, &fcfg);
-        (void)pcnt_unit_add_watch_point(s_pcnt_unit, FREQ_PCNT_HIGH_LIMIT);
-        pcnt_event_callbacks_t pcbs = {
-            .on_reach = on_pcnt_watch_reach_isr,
-        };
-        (void)pcnt_unit_register_event_callbacks(s_pcnt_unit, &pcbs, NULL);
-
-        pcnt_chan_config_t ccfg = {
-            .edge_gpio_num = pin,
-            .level_gpio_num = -1,
-        };
-        if (pcnt_new_channel(s_pcnt_unit, &ccfg, &s_pcnt_chan) == ESP_OK && s_pcnt_chan != NULL) {
-            (void)pcnt_channel_set_edge_action(
-                s_pcnt_chan, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
-        }
-        (void)pcnt_unit_enable(s_pcnt_unit);
+        err = pcnt_unit_set_glitch_filter(s_pcnt_unit, &fcfg);
+    } else {
+        err = pcnt_unit_set_glitch_filter(s_pcnt_unit, NULL);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "pcnt_unit_set_glitch_filter(%u ns) failed: %s",
+                 (unsigned)glitch_ns, esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
     }
 
-    /* 3. Configure RMT RX channel on `pin` at 1 MHz (1 us tick) resolution */
-    rmt_rx_channel_config_t rcfg = {
-        .gpio_num = pin,
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = FREQ_RMT_RESOLUTION_HZ,
-        .mem_block_symbols = FREQ_RMT_BOUNCE_SYMBOLS,
+    err = pcnt_unit_add_watch_point(s_pcnt_unit, FREQ_PCNT_HIGH_LIMIT);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "pcnt_unit_add_watch_point failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+    pcnt_event_callbacks_t pcbs = {
+        .on_reach = on_pcnt_watch_reach_isr,
     };
-    if (rmt_new_rx_channel(&rcfg, &s_rmt_chan) == ESP_OK && s_rmt_chan != NULL) {
-        rmt_rx_event_callbacks_t rcbs = {
-            .on_recv_done = on_rmt_rx_done_isr,
-        };
-        (void)rmt_rx_register_event_callbacks(s_rmt_chan, &rcbs, NULL);
-        if (rmt_enable(s_rmt_chan) == ESP_OK) {
-            s_rmt_enabled = true;
-        }
+    err = pcnt_unit_register_event_callbacks(s_pcnt_unit, &pcbs, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "pcnt_unit_register_event_callbacks failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
     }
+
+    pcnt_chan_config_t ccfg = {
+        .edge_gpio_num = pin,
+        .level_gpio_num = -1,
+    };
+    err = pcnt_new_channel(s_pcnt_unit, &ccfg, &s_pcnt_chan);
+    if (err != ESP_OK || s_pcnt_chan == NULL) {
+        ESP_LOGE(TAG, "pcnt_new_channel(GPIO%d) failed: %s", (int)pin, esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return (err != ESP_OK) ? err : ESP_FAIL;
+    }
+    err = pcnt_channel_set_edge_action(
+        s_pcnt_chan, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "pcnt_channel_set_edge_action failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+    err = pcnt_unit_enable(s_pcnt_unit);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "pcnt_unit_enable failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+
+    /* 3. Configure per-pin GPIO edge interrupt (`GPIO_INTR_ANYEDGE`) for continuous 1/T period & duty capture */
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+
+    err = gpio_set_intr_type(pin, GPIO_INTR_ANYEDGE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_set_intr_type(GPIO%d) failed: %s", (int)pin, esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+
+    err = gpio_isr_handler_add(pin, on_freq_gpio_edge_isr, (void *)(intptr_t)pin);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_isr_handler_add(GPIO%d) failed: %s", (int)pin, esp_err_to_name(err));
+        teardown_freq_peripherals();
+        return err;
+    }
+    (void)gpio_intr_disable(pin);
+    s_gpio_isr_registered = true;
 
     s_hw_configured_pin = pin;
+    s_hw_configured_glitch_ns = glitch_ns;
     return ESP_OK;
 }
 
@@ -453,13 +626,43 @@ static bool wait_gate_or_abort(int64_t deadline_us, uint32_t start_seq, bool is_
     return !should_abort_capture(start_seq, is_bg_worker);
 }
 
+static bool wait_for_third_edge_or_abort(int64_t deadline_us, uint32_t start_seq, bool is_bg_worker)
+{
+    int64_t remaining_us = deadline_us - esp_timer_get_time();
+    while (remaining_us > 0 && s_edge_isr_count < 3U) {
+        if (should_abort_capture(start_seq, is_bg_worker)) {
+            return false;
+        }
+        if (remaining_us >= 2000) {
+            uint32_t delay_ms = (uint32_t)((remaining_us - 1000) / 1000);
+            if (delay_ms > 5U) {
+                delay_ms = 5U;
+            }
+            TickType_t ticks = pdMS_TO_TICKS(delay_ms);
+            if (ticks == 0) {
+                ticks = 1;
+            }
+            vTaskDelay(ticks);
+        } else {
+            taskYIELD();
+        }
+        remaining_us = deadline_us - esp_timer_get_time();
+    }
+    return !should_abort_capture(start_seq, is_bg_worker);
+}
+
 static esp_err_t capture_freq_window(gpio_num_t pin,
+                                     freq_mode_t mode,
+                                     uint32_t glitch_ns,
                                      uint32_t gate_window_us,
                                      uint32_t start_seq,
                                      bool is_bg_worker,
                                      rmt_symbol_word_t *out_psram_symbols,
                                      size_t max_symbols,
                                      size_t *out_num_symbols,
+                                     freq_edge_stamp_t *out_psram_edges,
+                                     size_t max_edges,
+                                     size_t *out_num_edges,
                                      uint64_t *out_pcnt_pulses,
                                      uint64_t *out_actual_gate_us,
                                      freq_pcnt_edge_mode_t *out_edge_mode,
@@ -468,6 +671,7 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
 {
     *out_aborted = false;
     *out_num_symbols = 0U;
+    *out_num_edges = 0U;
     *out_pcnt_pulses = 0U;
     *out_actual_gate_us = gate_window_us;
     *out_edge_mode = FREQ_PCNT_EDGES_BOTH;
@@ -492,60 +696,91 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
                          custom_ctx);
     }
 
-    (void)ensure_freq_peripherals(pin);
+    esp_err_t err = ensure_freq_peripherals(pin, glitch_ns);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    s_rmt_isr_symbol_count = 0U;
-    s_rmt_isr_done = false;
+    s_edge_capture_active = false;
+    s_edge_isr_count = 0U;
     s_pcnt_overflow_accum = 0;
+    s_pcnt_gate_running = false;
     s_gate_alarm_fired = false;
+    s_gate_isr_stop_us = 0;
 
-    /* Start RMT RX capture into internal SRAM bounce buffer */
-    if (s_rmt_chan != NULL && s_rmt_enabled) {
-        rmt_receive_config_t rx_cfg = {
-            .signal_range_min_ns = FREQ_DEFAULT_GLITCH_NS,
-            .signal_range_max_ns = 20000000U, /* 20 ms idle threshold */
-        };
-        (void)rmt_receive(
-            s_rmt_chan, s_rmt_bounce_buf, sizeof(s_rmt_bounce_buf), &rx_cfg);
+    /* Reset PCNT hardware pulse counter & GPTimer gate window */
+    err = pcnt_unit_stop(s_pcnt_unit);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = pcnt_unit_clear_count(s_pcnt_unit);
+    if (err != ESP_OK) {
+        return err;
     }
 
-    /* Reset and start PCNT hardware pulse counter + GPTimer gate window */
-    if (s_pcnt_unit != NULL) {
-        (void)pcnt_unit_stop(s_pcnt_unit);
-        (void)pcnt_unit_clear_count(s_pcnt_unit);
+    (void)gptimer_stop(s_gptimer);
+    err = gptimer_set_raw_count(s_gptimer, 0ULL);
+    if (err != ESP_OK) {
+        return err;
     }
-    if (s_gptimer != NULL && s_gptimer_enabled) {
-        (void)gptimer_stop(s_gptimer);
-        (void)gptimer_set_raw_count(s_gptimer, 0ULL);
-        gptimer_alarm_config_t acfg = {
-            .alarm_count = gate_window_us,
-            .reload_count = 0ULL,
-        };
-        (void)gptimer_set_alarm_action(s_gptimer, &acfg);
-        (void)gptimer_start(s_gptimer);
+    gptimer_alarm_config_t acfg = {
+        .alarm_count = gate_window_us,
+        .reload_count = 0ULL,
+    };
+    err = gptimer_set_alarm_action(s_gptimer, &acfg);
+    if (err != ESP_OK) {
+        return err;
     }
 
     int64_t start_us = esp_timer_get_time();
     *out_timestamp_us = (uint64_t)start_us;
-    if (s_pcnt_unit != NULL) {
-        (void)pcnt_unit_start(s_pcnt_unit);
+
+    /* Enable GPIO edge ISR timestamp capture when 1/T period or AUTO mode is active */
+    if (mode != FREQ_MODE_GATE_PCNT) {
+        s_edge_capture_active = true;
+        err = gpio_intr_enable(pin);
+        if (err != ESP_OK) {
+            s_edge_capture_active = false;
+            return err;
+        }
+    }
+
+    err = gptimer_start(s_gptimer);
+    if (err != ESP_OK) {
+        s_edge_capture_active = false;
+        (void)gpio_intr_disable(pin);
+        return err;
+    }
+    s_pcnt_gate_running = true;
+    err = pcnt_unit_start(s_pcnt_unit);
+    if (err != ESP_OK) {
+        s_pcnt_gate_running = false;
+        s_edge_capture_active = false;
+        (void)gpio_intr_disable(pin);
+        (void)gptimer_stop(s_gptimer);
+        return err;
     }
 
     bool ok = wait_gate_or_abort(start_us + (int64_t)gate_window_us, start_seq, is_bg_worker);
 
-    if (s_pcnt_unit != NULL) {
+    if (s_pcnt_gate_running) {
         (void)pcnt_unit_stop(s_pcnt_unit);
+        s_pcnt_gate_running = false;
     }
-    int64_t end_us = esp_timer_get_time();
-    if (s_gptimer != NULL && s_gptimer_enabled) {
-        (void)gptimer_stop(s_gptimer);
+    int64_t gate_end_us = (s_gate_isr_stop_us > start_us) ? s_gate_isr_stop_us : esp_timer_get_time();
+    (void)gptimer_stop(s_gptimer);
+
+    /* If a slow periodic signal (< 100 Hz) produced 1..2 edges during a short 20 ms gate window,
+     * cooperatively wait up to FREQ_SLOW_PERIOD_EXTEND_US for the 3rd edge so 1 full cycle is captured. */
+    if (ok && mode != FREQ_MODE_GATE_PCNT && s_edge_isr_count >= 1U && s_edge_isr_count < 3U) {
+        int64_t ext_deadline = start_us + (int64_t)FREQ_SLOW_PERIOD_EXTEND_US;
+        if (ext_deadline > gate_end_us) {
+            ok = wait_for_third_edge_or_abort(ext_deadline, start_seq, is_bg_worker);
+        }
     }
 
-    /* Reset RMT RX channel if still waiting for edges so next receive is clean */
-    if (s_rmt_chan != NULL && s_rmt_enabled && !s_rmt_isr_done) {
-        (void)rmt_disable(s_rmt_chan);
-        (void)rmt_enable(s_rmt_chan);
-    }
+    s_edge_capture_active = false;
+    (void)gpio_intr_disable(pin);
 
     if (!ok) {
         *out_aborted = true;
@@ -553,8 +788,9 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
     }
 
     int unit_count = 0;
-    if (s_pcnt_unit != NULL) {
-        (void)pcnt_unit_get_count(s_pcnt_unit, &unit_count);
+    err = pcnt_unit_get_count(s_pcnt_unit, &unit_count);
+    if (err != ESP_OK) {
+        return err;
     }
     int64_t total_edges = s_pcnt_overflow_accum + (int64_t)unit_count;
     if (total_edges < 0) {
@@ -562,20 +798,20 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
     }
     *out_pcnt_pulses = (uint64_t)total_edges;
 
-    int64_t elapsed_us = end_us - start_us;
+    int64_t elapsed_us = gate_end_us - start_us;
     if (elapsed_us <= 0) {
         elapsed_us = (int64_t)gate_window_us;
     }
     *out_actual_gate_us = (uint64_t)elapsed_us;
 
-    /* Copy RMT symbols from internal SRAM bounce buffer into PSRAM staging buffer */
-    size_t rmt_cnt = s_rmt_isr_symbol_count;
-    if (rmt_cnt > max_symbols) {
-        rmt_cnt = max_symbols;
+    /* Copy GPIO edge timestamps from internal SRAM bounce buffer into PSRAM staging buffer */
+    size_t edge_cnt = s_edge_isr_count;
+    if (edge_cnt > max_edges) {
+        edge_cnt = max_edges;
     }
-    if (rmt_cnt > 0U && out_psram_symbols != NULL) {
-        memcpy(out_psram_symbols, (const void *)s_rmt_bounce_buf, rmt_cnt * sizeof(rmt_symbol_word_t));
-        *out_num_symbols = rmt_cnt;
+    if (edge_cnt > 0U && out_psram_edges != NULL) {
+        memcpy(out_psram_edges, (const void *)s_edge_bounce_buf, edge_cnt * sizeof(freq_edge_stamp_t));
+        *out_num_edges = edge_cnt;
     }
 
     return ESP_OK;
@@ -583,7 +819,7 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
 
 static esp_err_t freq_worker_step_locked(bool is_bg_worker)
 {
-    if (s_psram_symbols == NULL) {
+    if (s_psram_symbols == NULL || s_psram_edges == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -591,6 +827,7 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
     gpio_num_t pin = s_selected_pin;
     freq_mode_t mode = s_mode;
     freq_gate_window_t gate_win = s_gate_window;
+    uint32_t glitch_ns = s_pcnt_glitch_ns;
     bool running = s_running;
     bool stop_req = s_stop_requested;
     bool do_reset = s_reset_requested;
@@ -613,6 +850,7 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
     }
 
     size_t num_symbols = 0U;
+    size_t num_edges = 0U;
     uint64_t pcnt_pulses = 0U;
     uint64_t actual_gate_us = gate_us;
     freq_pcnt_edge_mode_t edge_mode = FREQ_PCNT_EDGES_BOTH;
@@ -620,12 +858,17 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
     bool aborted = false;
 
     esp_err_t err = capture_freq_window(pin,
+                                        mode,
+                                        glitch_ns,
                                         gate_us,
                                         start_seq,
                                         is_bg_worker,
                                         s_psram_symbols,
                                         FREQ_PSRAM_SYMBOL_BUF_CAP,
                                         &num_symbols,
+                                        s_psram_edges,
+                                        FREQ_EDGE_RING_CAPACITY,
+                                        &num_edges,
                                         &pcnt_pulses,
                                         &actual_gate_us,
                                         &edge_mode,
@@ -635,15 +878,49 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
         return ESP_OK;
     }
     if (err != ESP_OK) {
+        freq_reading_t err_reading = {0};
+        portENTER_CRITICAL(&s_freq_lock);
+        s_latest_reading.signal_detected = false;
+        s_latest_reading.duty_valid = false;
+        s_latest_reading.active_method = FREQ_METHOD_NONE;
+        s_latest_reading.hw_error = err;
+        s_latest_reading.freq_hz = 0.0f;
+        s_latest_reading.period_us = 0.0f;
+        s_latest_reading.pulse_width_us = NAN;
+        s_latest_reading.low_width_us = NAN;
+        s_latest_reading.duty_pct = NAN;
+        s_latest_reading.rpm = 0.0f;
+        err_reading = s_latest_reading;
+        portEXIT_CRITICAL(&s_freq_lock);
+
+        freq_frame_t *wptr = (freq_frame_t *)psram_double_buf_get_write_ptr(&s_frame_dbuf);
+        if (wptr != NULL) {
+            wptr->reading = err_reading;
+            wptr->pin = pin;
+            wptr->mode = mode;
+            wptr->gate_window = gate_win;
+            wptr->running = running;
+            (void)psram_double_buf_swap(&s_frame_dbuf);
+        }
         return err;
     }
 
-    freq_period_result_t period_res = {0};
-    (void)freq_calc_from_rmt_symbols(
-        s_psram_symbols, num_symbols, FREQ_RMT_RESOLUTION_HZ, FREQ_DEFAULT_GLITCH_NS, &period_res);
-
     freq_gate_result_t gate_res = {0};
     (void)freq_calc_from_gate_counts(pcnt_pulses, actual_gate_us, edge_mode, &gate_res);
+
+    freq_period_result_t period_res = {0};
+    if (num_symbols > 0U) {
+        (void)freq_calc_from_rmt_symbols(
+            s_psram_symbols, num_symbols, FREQ_RMT_RESOLUTION_HZ, FREQ_PERIOD_DEFAULT_GLITCH_NS, &period_res);
+    } else if (num_edges >= 3U) {
+        (void)freq_calc_from_edge_timestamps(
+            s_psram_edges, num_edges, FREQ_PERIOD_DEFAULT_GLITCH_NS, &period_res);
+        /* Above FREQ_MAX_EDGE_DUTY_HZ in AUTO mode, 1 us software ISR timestamps cannot
+         * accurately resolve sub-microsecond pulse widths, so rely on gate counts alone. */
+        if (mode == FREQ_MODE_AUTO && gate_res.valid && gate_res.freq_hz > FREQ_MAX_EDGE_DUTY_HZ) {
+            memset(&period_res, 0, sizeof(period_res));
+        }
+    }
 
     freq_reading_t reading = {0};
     (void)freq_calc_combine_reading(mode, prev_method, &period_res, &gate_res, &s_tracker, &reading);
@@ -662,6 +939,16 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
                 .bytes_per_sample = sizeof(rmt_symbol_word_t),
             };
             (void)recorder_sink_push(&rec_frame);
+        } else if (num_edges >= 3U) {
+            recorder_frame_t rec_frame = {
+                .tool_id = FREQ_TOOL_ID,
+                .sample_rate_hz = FREQ_RMT_RESOLUTION_HZ,
+                .timestamp_us = capture_ts_us,
+                .samples = s_psram_edges,
+                .sample_count = num_edges,
+                .bytes_per_sample = sizeof(freq_edge_stamp_t),
+            };
+            (void)recorder_sink_push(&rec_frame);
         } else {
             recorder_frame_t rec_frame = {
                 .tool_id = FREQ_TOOL_ID,
@@ -675,9 +962,16 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
         }
     }
 
+    uint32_t hwm_bytes = is_bg_worker ? (uint32_t)uxTaskGetStackHighWaterMark(NULL) : 0U;
     portENTER_CRITICAL(&s_freq_lock);
     s_prev_method = reading.active_method;
     s_latest_reading = reading;
+    if (is_bg_worker) {
+        if (s_worker_min_stack_hwm_bytes == 0U || hwm_bytes < s_worker_min_stack_hwm_bytes) {
+            s_worker_min_stack_hwm_bytes = hwm_bytes;
+        }
+        s_worker_completed_steps++;
+    }
     portEXIT_CRITICAL(&s_freq_lock);
 
     freq_frame_t *wptr = (freq_frame_t *)psram_double_buf_get_write_ptr(&s_frame_dbuf);
@@ -702,7 +996,10 @@ static esp_err_t freq_worker_step(void *ctx)
     }
     esp_err_t err = freq_worker_step_locked(true);
     (void)xSemaphoreGive(s_step_mutex);
-    return err;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Worker capture step returned error: %s", esp_err_to_name(err));
+    }
+    return ESP_OK;
 }
 
 esp_err_t tool_freq_run_single_step(void)
@@ -940,11 +1237,14 @@ static void freq_on_ui_refresh(void *ctx)
         if (!running) {
             lv_label_set_text(s_lbl_method_badge, "HOLD");
             lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0xFF5252), 0);
+        } else if (frame.reading.hw_error != ESP_OK) {
+            lv_label_set_text_fmt(s_lbl_method_badge, "%s [HW ERR]", freq_calc_mode_to_str(mode));
+            lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0xFF5252), 0);
         } else if (!frame.reading.signal_detected) {
             lv_label_set_text_fmt(s_lbl_method_badge, "%s [NO SIG]", freq_calc_mode_to_str(mode));
             lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0xFFD54F), 0);
         } else if (frame.reading.active_method == FREQ_METHOD_PERIOD) {
-            lv_label_set_text_fmt(s_lbl_method_badge, "%s [RMT 1/T]", freq_calc_mode_to_str(mode));
+            lv_label_set_text_fmt(s_lbl_method_badge, "%s [EDGE 1/T]", freq_calc_mode_to_str(mode));
             lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0x00E676), 0);
         } else {
             lv_label_set_text_fmt(s_lbl_method_badge, "%s [PCNT GATE]", freq_calc_mode_to_str(mode));
@@ -963,28 +1263,47 @@ static void freq_on_ui_refresh(void *ctx)
         lv_label_set_text_fmt(s_lbl_rpm, "%ld RPM", rpm_val);
     }
 
+    bool duty_ok = frame.reading.signal_detected &&
+                   frame.reading.duty_valid &&
+                   isfinite(frame.reading.duty_pct) &&
+                   isfinite(frame.reading.pulse_width_us) &&
+                   isfinite(frame.reading.low_width_us);
+
     if (s_lbl_period_pw != NULL) {
         long t_tenths = lroundf(frame.reading.period_us * 10.0f);
-        long pw_tenths = lroundf(frame.reading.pulse_width_us * 10.0f);
-        long lw_tenths = lroundf(frame.reading.low_width_us * 10.0f);
-        lv_label_set_text_fmt(s_lbl_period_pw,
-                              "T:%ld.%ldus  PW+:%ld.%ldus  PW-:%ld.%ldus",
-                              t_tenths / 10L, labs(t_tenths % 10L),
-                              pw_tenths / 10L, labs(pw_tenths % 10L),
-                              lw_tenths / 10L, labs(lw_tenths % 10L));
+        if (duty_ok) {
+            long pw_tenths = lroundf(frame.reading.pulse_width_us * 10.0f);
+            long lw_tenths = lroundf(frame.reading.low_width_us * 10.0f);
+            lv_label_set_text_fmt(s_lbl_period_pw,
+                                  "T:%ld.%ldus  PW+:%ld.%ldus  PW-:%ld.%ldus",
+                                  t_tenths / 10L, labs(t_tenths % 10L),
+                                  pw_tenths / 10L, labs(pw_tenths % 10L),
+                                  lw_tenths / 10L, labs(lw_tenths % 10L));
+        } else {
+            lv_label_set_text_fmt(s_lbl_period_pw,
+                                  "T:%ld.%ldus  PW+: --  PW-: --",
+                                  t_tenths / 10L, labs(t_tenths % 10L));
+        }
     }
 
-    int duty_tenths = (int)lroundf(frame.reading.duty_pct * 10.0f);
     if (s_lbl_duty_val != NULL) {
-        lv_label_set_text_fmt(
-            s_lbl_duty_val, "Duty: %d.%d%%", duty_tenths / 10, abs(duty_tenths % 10));
+        if (duty_ok) {
+            int duty_tenths = (int)lroundf(frame.reading.duty_pct * 10.0f);
+            lv_label_set_text_fmt(
+                s_lbl_duty_val, "Duty: %d.%d%%", duty_tenths / 10, abs(duty_tenths % 10));
+        } else {
+            lv_label_set_text(s_lbl_duty_val, "Duty: --");
+        }
     }
     if (s_bar_duty != NULL) {
-        int duty_clamped = duty_tenths / 10;
-        if (duty_clamped < 0) {
-            duty_clamped = 0;
-        } else if (duty_clamped > 100) {
-            duty_clamped = 100;
+        int duty_clamped = 0;
+        if (duty_ok) {
+            duty_clamped = (int)lroundf(frame.reading.duty_pct);
+            if (duty_clamped < 0) {
+                duty_clamped = 0;
+            } else if (duty_clamped > 100) {
+                duty_clamped = 100;
+            }
         }
         lv_bar_set_value(s_bar_duty, duty_clamped, LV_ANIM_OFF);
     }
@@ -1028,6 +1347,10 @@ static void free_freq_buffers(void)
         psram_buf_free(s_psram_symbols);
         s_psram_symbols = NULL;
     }
+    if (s_psram_edges != NULL) {
+        psram_buf_free(s_psram_edges);
+        s_psram_edges = NULL;
+    }
 }
 
 static esp_err_t freq_on_start(lv_obj_t *parent_cont, void *ctx)
@@ -1055,7 +1378,9 @@ static esp_err_t freq_on_start(lv_obj_t *parent_cont, void *ctx)
 
     s_psram_symbols = (rmt_symbol_word_t *)psram_buf_calloc(
         FREQ_PSRAM_SYMBOL_BUF_CAP, sizeof(rmt_symbol_word_t));
-    if (s_psram_symbols == NULL) {
+    s_psram_edges = (freq_edge_stamp_t *)psram_buf_calloc(
+        FREQ_EDGE_RING_CAPACITY, sizeof(freq_edge_stamp_t));
+    if (s_psram_symbols == NULL || s_psram_edges == NULL) {
         free_freq_buffers();
         (void)bsp_pin_release(pin, FREQ_TOOL_ID);
         return ESP_ERR_NO_MEM;
@@ -1070,24 +1395,28 @@ static esp_err_t freq_on_start(lv_obj_t *parent_cont, void *ctx)
     s_reset_requested = false;
     s_capture_seq++;
     s_prev_method = FREQ_METHOD_NONE;
+    s_worker_min_stack_hwm_bytes = 0U;
+    s_worker_completed_steps = 0U;
     memset(&s_latest_reading, 0, sizeof(s_latest_reading));
+    s_latest_reading.duty_pct = NAN;
+    s_latest_reading.pulse_width_us = NAN;
+    s_latest_reading.low_width_us = NAN;
     s_tool_active = true;
     freq_capture_source_fn_t custom_fn = s_custom_source_fn;
-    freq_gate_window_t start_gate = s_gate_window;
     portEXIT_CRITICAL(&s_freq_lock);
 
     if (parent_cont != NULL) {
         build_freq_ui(parent_cont);
     }
 
-    /* Run an immediate initial step when a custom source or fast 20ms gate is configured */
-    if (custom_fn != NULL || start_gate == FREQ_GATE_20MS) {
+    /* Run an immediate initial step when a custom test capture source is configured */
+    if (custom_fn != NULL) {
         (void)tool_freq_run_single_step();
     }
 
     tool_worker_config_t wcfg = {
         .name = "freq_c1",
-        .stack_size_bytes = 4096,
+        .stack_size_bytes = FREQ_WORKER_STACK_BYTES,
         .priority = 5,
         .core_id = TOOL_WORKER_DEFAULT_CORE,
         .period_ms = FREQ_WORKER_PERIOD_MS,
@@ -1183,12 +1512,32 @@ static esp_err_t freq_selftest(void)
         return ESP_FAIL;
     }
 
+    /* Verify continuous GPIO edge timestamp period/duty calculation (1 kHz, 25% duty) */
+    const freq_edge_stamp_t edges[5] = {
+        {.timestamp_us = 1000ULL, .level = 1U},
+        {.timestamp_us = 1250ULL, .level = 0U},
+        {.timestamp_us = 2000ULL, .level = 1U},
+        {.timestamp_us = 2250ULL, .level = 0U},
+        {.timestamp_us = 3000ULL, .level = 1U},
+    };
+    memset(&pres, 0, sizeof(pres));
+    if (freq_calc_from_edge_timestamps(edges, 5U, FREQ_PERIOD_DEFAULT_GLITCH_NS, &pres) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (!pres.valid || pres.cycles_measured != 2U || fabsf(pres.freq_hz - 1000.0f) > 1.0f ||
+        fabsf(pres.duty_pct - 25.0f) > 0.5f) {
+        return ESP_FAIL;
+    }
+
     /* Verify 250 kHz PCNT gate counting (50,000 both-edges in 100,000 us -> 250,000 Hz) */
     freq_gate_result_t gres = {0};
     if (freq_calc_from_gate_counts(50000ULL, 100000ULL, FREQ_PCNT_EDGES_BOTH, &gres) != ESP_OK) {
         return ESP_FAIL;
     }
     if (!gres.valid || fabsf(gres.freq_hz - 250000.0f) > 1.0f) {
+        return ESP_FAIL;
+    }
+    if (freq_calc_pcnt_max_freq_hz(tool_freq_get_pcnt_glitch_ns()) < 10000000.0f) {
         return ESP_FAIL;
     }
     return ESP_OK;

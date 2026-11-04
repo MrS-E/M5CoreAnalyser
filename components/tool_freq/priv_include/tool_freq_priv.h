@@ -42,6 +42,38 @@ void tool_freq_set_capture_source(freq_capture_source_fn_t fn, void *user_ctx);
  */
 esp_err_t tool_freq_run_single_step(void);
 
+/**
+ * @brief Record a GPIO edge transition directly into the `IRAM_ATTR` internal SRAM edge ring buffer
+ *        during an active capture window (test seam for QEMU where GPIO pad output is not externally looped).
+ *
+ * @param[in] pin          GPIO pin number where the transition occurred.
+ * @param[in] timestamp_us Edge timestamp in microseconds (`esp_timer_get_time()`).
+ * @param[in] level        Logic level (`0` or `1`) immediately after the transition.
+ */
+void tool_freq_record_edge_isr_for_test(gpio_num_t pin, uint64_t timestamp_us, uint8_t level);
+
+/**
+ * @brief Inject a simulated ESP-IDF peripheral driver error into `ensure_freq_peripherals()`
+ *        to verify error propagation and recovery (`ESP_OK` to clear).
+ *
+ * @param[in] err Simulated driver error code (`ESP_OK` for normal hardware operation).
+ */
+void tool_freq_set_driver_error_for_test(esp_err_t err);
+
+/**
+ * @brief Return the minimum observed FreeRTOS stack high-water mark in bytes on the `freq_c1` worker task.
+ *
+ * @return Minimum free stack bytes observed on `freq_c1` (`0` if worker has not stepped yet).
+ */
+uint32_t tool_freq_get_worker_stack_hwm_bytes(void);
+
+/**
+ * @brief Return the number of measurement steps completed directly by the `freq_c1` background worker task.
+ *
+ * @return Count of completed worker steps since `on_start`.
+ */
+uint32_t tool_freq_get_worker_completed_steps(void);
+
 #ifdef __cplusplus
 }
 #endif
