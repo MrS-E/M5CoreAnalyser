@@ -319,7 +319,7 @@ esp_err_t tool_core_start_tool(const char *tool_id, lv_obj_t *parent_cont)
     }
 
     /* Stop any existing foreground tool before starting the new one */
-    if (s_active_tool != NULL) {
+    if (__atomic_load_n(&s_active_tool, __ATOMIC_ACQUIRE) != NULL) {
         (void)tool_core_stop_active_tool(false);
     }
 
@@ -339,7 +339,7 @@ esp_err_t tool_core_start_tool(const char *tool_id, lv_obj_t *parent_cont)
         return err;
     }
 
-    s_active_tool = target;
+    __atomic_store_n(&s_active_tool, target, __ATOMIC_RELEASE);
     tool_unlock();
 
     ESP_LOGI(TAG, "Started foreground tool '%s'", target->id);
@@ -349,17 +349,17 @@ esp_err_t tool_core_start_tool(const char *tool_id, lv_obj_t *parent_cont)
 esp_err_t tool_core_stop_active_tool(bool keep_background)
 {
     tool_lock();
-    if (s_active_tool == NULL) {
+    const analyser_tool_t *stopping = __atomic_load_n(&s_active_tool, __ATOMIC_ACQUIRE);
+    if (stopping == NULL) {
         tool_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
-    const analyser_tool_t *stopping = s_active_tool;
     int idx = find_tool_index_locked(stopping->id);
     bool effective_keep_bg = keep_background && stopping->supports_background;
 
     esp_err_t err = stopping->on_stop(effective_keep_bg, stopping->user_ctx);
-    s_active_tool = NULL;
+    __atomic_store_n(&s_active_tool, NULL, __ATOMIC_RELEASE);
 
     if (idx >= 0) {
         if (effective_keep_bg && err == ESP_OK) {
@@ -450,10 +450,7 @@ esp_err_t tool_core_stop_all_background_tools(void)
 
 const analyser_tool_t *tool_core_get_active_tool(void)
 {
-    tool_lock();
-    const analyser_tool_t *active = s_active_tool;
-    tool_unlock();
-    return active;
+    return __atomic_load_n(&s_active_tool, __ATOMIC_ACQUIRE);
 }
 
 bool tool_core_is_tool_running_bg(const char *tool_id)

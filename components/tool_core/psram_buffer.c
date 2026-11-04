@@ -138,7 +138,7 @@ esp_err_t psram_double_buf_alloc(psram_double_buf_t *dbuf, size_t capacity_sampl
 
 void psram_double_buf_free(psram_double_buf_t *dbuf)
 {
-    if (dbuf == NULL) {
+    if (dbuf == NULL || (dbuf->buf_a == NULL && dbuf->buf_b == NULL && dbuf->buf_c == NULL)) {
         return;
     }
 
