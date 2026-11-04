@@ -35,7 +35,6 @@ static const char *TAG = "tool_freq";
 #define FREQ_WORKER_PERIOD_MS       (20)
 #define FREQ_WORKER_STOP_WAIT_MS    (2000)
 #define FREQ_WORKER_STOP_RETRIES    (5)
-#define FREQ_SLOW_PERIOD_EXTEND_US  (200000ULL) /**< Max cooperative extension when 1..2 slow edges seen in short gate */
 
 static const gpio_num_t s_supported_pins[] = {
     BSP_PIN_ANALOG_IN_DEFAULT, /* GPIO36 (Port B / M5-Bus default) */
@@ -68,10 +67,14 @@ static volatile uint32_t s_capture_seq = 0;
 static esp_err_t s_injected_driver_err = ESP_OK;
 static uint32_t s_worker_min_stack_hwm_bytes = 0U;
 static uint32_t s_worker_completed_steps = 0U;
+static uint32_t s_edge_acq_max_us = FREQ_EDGE_ACQ_DEFAULT_MAX_US;
+static freq_window_stats_t s_last_window_stats = {0};
 
 /* Internal SRAM ISR bounce buffers & state (never in PSRAM) */
 static DRAM_ATTR freq_edge_stamp_t s_edge_bounce_buf[FREQ_EDGE_RING_CAPACITY];
 static DRAM_ATTR volatile size_t s_edge_isr_count = 0;
+static DRAM_ATTR volatile uint32_t s_edge_isr_invocations = 0;
+static DRAM_ATTR volatile bool s_edge_isr_capped = false;
 static DRAM_ATTR volatile bool s_edge_capture_active = false;
 static DRAM_ATTR volatile int64_t s_pcnt_overflow_accum = 0;
 static DRAM_ATTR volatile bool s_pcnt_gate_running = false;
@@ -308,6 +311,35 @@ uint32_t tool_freq_get_worker_stack_hwm_bytes(void)
     return hwm;
 }
 
+void tool_freq_get_last_window_stats(freq_window_stats_t *out_stats)
+{
+    if (out_stats == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_freq_lock);
+    *out_stats = s_last_window_stats;
+    portEXIT_CRITICAL(&s_freq_lock);
+}
+
+esp_err_t tool_freq_set_edge_acq_max_us(uint32_t max_us)
+{
+    if (max_us < FREQ_EDGE_ACQ_LIMIT_MIN_US || max_us > FREQ_EDGE_ACQ_LIMIT_MAX_US) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_freq_lock);
+    s_edge_acq_max_us = max_us;
+    portEXIT_CRITICAL(&s_freq_lock);
+    return ESP_OK;
+}
+
+uint32_t tool_freq_get_edge_acq_max_us(void)
+{
+    portENTER_CRITICAL(&s_freq_lock);
+    uint32_t v = s_edge_acq_max_us;
+    portEXIT_CRITICAL(&s_freq_lock);
+    return v;
+}
+
 uint32_t tool_freq_get_worker_completed_steps(void)
 {
     portENTER_CRITICAL(&s_freq_lock);
@@ -341,20 +373,27 @@ static void IRAM_ATTR record_edge_sample_iram(uint64_t now_us, uint8_t level, gp
     if (!s_edge_capture_active) {
         return;
     }
+    /* Count every entry (stored or dropped same-level) so aliased / narrow-glitch inputs cannot
+     * keep the interrupt firing for the whole (up to 2 s) acquisition window. */
+    uint32_t invocations = s_edge_isr_invocations + 1U;
+    s_edge_isr_invocations = invocations;
+
     uint8_t lvl = (uint8_t)(level & 1U);
     size_t idx = s_edge_isr_count;
-    if (idx > 0U && s_edge_bounce_buf[idx - 1U].level == lvl) {
-        return;
-    }
-    if (idx < FREQ_EDGE_RING_CAPACITY) {
+    if (idx < FREQ_EDGE_RING_CAPACITY && (idx == 0U || s_edge_bounce_buf[idx - 1U].level != lvl)) {
         s_edge_bounce_buf[idx].timestamp_us = now_us;
         s_edge_bounce_buf[idx].level = lvl;
         idx++;
         s_edge_isr_count = idx;
-        if (idx >= FREQ_EDGE_RING_CAPACITY) {
-            s_edge_capture_active = false;
-            (void)gpio_intr_disable(pin);
-        }
+    }
+
+    if (idx >= FREQ_EDGE_RING_CAPACITY) {
+        s_edge_capture_active = false;
+        (void)gpio_intr_disable(pin);
+    } else if (invocations >= FREQ_EDGE_ISR_MAX_INVOCATIONS) {
+        s_edge_isr_capped = true;
+        s_edge_capture_active = false;
+        (void)gpio_intr_disable(pin);
     }
 }
 
@@ -626,29 +665,28 @@ static bool wait_gate_or_abort(int64_t deadline_us, uint32_t start_seq, bool is_
     return !should_abort_capture(start_seq, is_bg_worker);
 }
 
-static bool wait_for_third_edge_or_abort(int64_t deadline_us, uint32_t start_seq, bool is_bg_worker)
+/* Wait (cooperatively, <= FREQ_EDGE_POLL_MS per sleep) until `target` edges are stored, the edge ISR
+ * deactivates itself (ring full / invocation cap), or `deadline_us` passes. Returns false on cancel. */
+static bool wait_edges_or_abort(int64_t deadline_us, uint32_t target, uint32_t start_seq, bool is_bg_worker)
 {
-    int64_t remaining_us = deadline_us - esp_timer_get_time();
-    while (remaining_us > 0 && s_edge_isr_count < 3U) {
+    while (true) {
         if (should_abort_capture(start_seq, is_bg_worker)) {
             return false;
         }
-        if (remaining_us >= 2000) {
-            uint32_t delay_ms = (uint32_t)((remaining_us - 1000) / 1000);
-            if (delay_ms > 5U) {
-                delay_ms = 5U;
-            }
-            TickType_t ticks = pdMS_TO_TICKS(delay_ms);
-            if (ticks == 0) {
-                ticks = 1;
-            }
-            vTaskDelay(ticks);
-        } else {
-            taskYIELD();
+        if (s_edge_isr_count >= target || !s_edge_capture_active) {
+            return true;
         }
-        remaining_us = deadline_us - esp_timer_get_time();
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            return true;
+        }
+        uint32_t delay_ms = (uint32_t)(remaining_us / 1000);
+        if (delay_ms > FREQ_EDGE_POLL_MS) {
+            delay_ms = FREQ_EDGE_POLL_MS;
+        }
+        TickType_t ticks = pdMS_TO_TICKS(delay_ms);
+        vTaskDelay((ticks == 0) ? 1 : ticks);
     }
-    return !should_abort_capture(start_seq, is_bg_worker);
 }
 
 static esp_err_t capture_freq_window(gpio_num_t pin,
@@ -703,6 +741,8 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
 
     s_edge_capture_active = false;
     s_edge_isr_count = 0U;
+    s_edge_isr_invocations = 0U;
+    s_edge_isr_capped = false;
     s_pcnt_overflow_accum = 0;
     s_pcnt_gate_running = false;
     s_gate_alarm_fired = false;
@@ -732,11 +772,16 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
         return err;
     }
 
-    int64_t start_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_freq_lock);
+    uint32_t edge_acq_max_us = s_edge_acq_max_us;
+    portEXIT_CRITICAL(&s_freq_lock);
+
+    const bool edge_enabled = (mode != FREQ_MODE_GATE_PCNT);
+    int64_t start_us = esp_timer_get_time(); /* start of edge acquisition */
     *out_timestamp_us = (uint64_t)start_us;
 
     /* Enable GPIO edge ISR timestamp capture when 1/T period or AUTO mode is active */
-    if (mode != FREQ_MODE_GATE_PCNT) {
+    if (edge_enabled) {
         s_edge_capture_active = true;
         err = gpio_intr_enable(pin);
         if (err != ESP_OK) {
@@ -761,50 +806,67 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
         return err;
     }
 
-    /* If frequency is very low, wait up to 2 seconds for edges, otherwise gate. */
-    int64_t capture_deadline_us = start_us + (int64_t)gate_window_us;
-    if (prev_method == FREQ_METHOD_PERIOD && s_latest_reading.freq_hz > 0.0f && s_latest_reading.freq_hz < 10.0f) {
-        capture_deadline_us = start_us + 2000000LL;
-    }
+    /* The gate really begins once PCNT counts, so stamp it here (GPTimer was started first). */
+    int64_t gate_start_us = esp_timer_get_time();
 
-    bool ok = wait_gate_or_abort(capture_deadline_us, start_seq, is_bg_worker);
+    /* Phase 1: exact PCNT gate (alarm ISR stops PCNT); edge ISR runs concurrently. */
+    bool ok = wait_gate_or_abort(gate_start_us + (int64_t)gate_window_us, start_seq, is_bg_worker);
 
     if (s_pcnt_gate_running) {
         (void)pcnt_unit_stop(s_pcnt_unit);
         s_pcnt_gate_running = false;
     }
-    int64_t gate_end_us = (s_gate_isr_stop_us > start_us) ? s_gate_isr_stop_us : esp_timer_get_time();
+    int64_t gate_end_us = (s_gate_isr_stop_us > gate_start_us) ? s_gate_isr_stop_us : esp_timer_get_time();
     (void)gptimer_stop(s_gptimer);
 
-    /* If a slow periodic signal (< 100 Hz) produced 1..2 edges during a short 20 ms gate window,
-     * cooperatively wait up to FREQ_SLOW_PERIOD_EXTEND_US for the 3rd edge so 1 full cycle is captured. */
-    if (ok && mode != FREQ_MODE_GATE_PCNT && s_edge_isr_count >= 1U && s_edge_isr_count < 3U) {
-        int64_t ext_deadline = start_us + (int64_t)FREQ_SLOW_PERIOD_EXTEND_US;
-        if (ext_deadline > gate_end_us) {
-            ok = wait_for_third_edge_or_abort(ext_deadline, start_seq, is_bg_worker);
+    int unit_count = 0;
+    int64_t total_edges = 0;
+    if (ok) {
+        err = pcnt_unit_get_count(s_pcnt_unit, &unit_count);
+        if (err != ESP_OK) {
+            s_edge_capture_active = false;
+            (void)gpio_intr_disable(pin);
+            return err;
+        }
+        total_edges = s_pcnt_overflow_accum + (int64_t)unit_count;
+        if (total_edges < 0) {
+            total_edges = 0;
         }
     }
 
+    /* Phase 2: edge acquisition is independent of the gate and of any previous reading. If neither the
+     * gate nor the ISR has seen enough edges for 2 full periods, keep collecting edges (5 ms cancellable
+     * polls) until the target, the ISR cap, or the bounded acquisition limit (default 2 s, measured from
+     * capture start). The PCNT gate result above is not stretched. */
+    if (ok && edge_enabled && s_edge_capture_active &&
+        s_edge_isr_count < FREQ_EDGE_ACQ_TARGET_EDGES &&
+        total_edges < (int64_t)FREQ_EDGE_ACQ_TARGET_EDGES) {
+        ok = wait_edges_or_abort(start_us + (int64_t)edge_acq_max_us,
+                                 FREQ_EDGE_ACQ_TARGET_EDGES,
+                                 start_seq,
+                                 is_bg_worker);
+    }
+
+    int64_t acq_end_us = esp_timer_get_time();
     s_edge_capture_active = false;
     (void)gpio_intr_disable(pin);
+
+    portENTER_CRITICAL(&s_freq_lock);
+    s_last_window_stats.isr_invocations = s_edge_isr_invocations;
+    s_last_window_stats.isr_capped = s_edge_isr_capped;
+    s_last_window_stats.edges_stored = (uint32_t)s_edge_isr_count;
+    s_last_window_stats.acq_us = (uint32_t)(acq_end_us - start_us);
+    s_last_window_stats.windows++;
+    portEXIT_CRITICAL(&s_freq_lock);
 
     if (!ok) {
         *out_aborted = true;
         return ESP_ERR_INVALID_STATE;
     }
 
-    int unit_count = 0;
-    err = pcnt_unit_get_count(s_pcnt_unit, &unit_count);
-    if (err != ESP_OK) {
-        return err;
-    }
-    int64_t total_edges = s_pcnt_overflow_accum + (int64_t)unit_count;
-    if (total_edges < 0) {
-        total_edges = 0;
-    }
     *out_pcnt_pulses = (uint64_t)total_edges;
 
-    int64_t elapsed_us = gate_end_us - start_us;
+    int64_t elapsed_us = gate_end_us - gate_start_us;
     if (elapsed_us <= 0) {
         elapsed_us = (int64_t)gate_window_us;
     }
@@ -931,14 +993,6 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
     freq_reading_t reading = {0};
     (void)freq_calc_combine_reading(mode, prev_method, &period_res, &gate_res, &s_tracker, &reading);
 
-    /* Cross-check gate vs period for reliability: if significant discrepancy, invalidate duty cycle. */
-    float adjusted_freq = 0.0f;
-    if (freq_calc_cross_check(period_res.freq_hz, gate_res.freq_hz, gate_res.pulse_count, &adjusted_freq)) {
-        reading.duty_valid = false;
-        reading.pulse_width_us = NAN;
-        reading.low_width_us = NAN;
-        reading.duty_pct = NAN;
-    }
 
     if (recorder_sink_is_recording()) {
         uint32_t update_rate_hz = (actual_gate_us > 0U && actual_gate_us <= 1000000ULL)
@@ -1258,6 +1312,12 @@ static void freq_on_ui_refresh(void *ctx)
         } else if (!frame.reading.signal_detected) {
             lv_label_set_text_fmt(s_lbl_method_badge, "%s [NO SIG]", freq_calc_mode_to_str(mode));
             lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0xFFD54F), 0);
+        } else if (frame.reading.unreliable) {
+            lv_label_set_text_fmt(s_lbl_method_badge,
+                                  "%s [%s UNRELIABLE]",
+                                  freq_calc_mode_to_str(mode),
+                                  (frame.reading.active_method == FREQ_METHOD_GATE) ? "GATE" : "1/T");
+            lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0xFF9800), 0);
         } else if (frame.reading.active_method == FREQ_METHOD_PERIOD) {
             lv_label_set_text_fmt(s_lbl_method_badge, "%s [EDGE 1/T]", freq_calc_mode_to_str(mode));
             lv_obj_set_style_text_color(s_lbl_method_badge, lv_color_hex(0x00E676), 0);
@@ -1412,6 +1472,7 @@ static esp_err_t freq_on_start(lv_obj_t *parent_cont, void *ctx)
     s_prev_method = FREQ_METHOD_NONE;
     s_worker_min_stack_hwm_bytes = 0U;
     s_worker_completed_steps = 0U;
+    memset(&s_last_window_stats, 0, sizeof(s_last_window_stats));
     memset(&s_latest_reading, 0, sizeof(s_latest_reading));
     s_latest_reading.duty_pct = NAN;
     s_latest_reading.pulse_width_us = NAN;

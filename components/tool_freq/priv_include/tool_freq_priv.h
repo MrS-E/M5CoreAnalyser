@@ -74,6 +74,24 @@ uint32_t tool_freq_get_worker_stack_hwm_bytes(void);
  */
 uint32_t tool_freq_get_worker_completed_steps(void);
 
+/**
+ * @brief Statistics of the most recent completed (or cancelled) hardware capture window.
+ */
+typedef struct {
+    uint32_t isr_invocations; /**< GPIO edge ISR entries (stored AND dropped same-level samples) */
+    bool isr_capped;          /**< True if the ISR disabled itself at `FREQ_EDGE_ISR_MAX_INVOCATIONS` */
+    uint32_t edges_stored;    /**< Edge timestamps stored in the internal SRAM ring */
+    uint32_t acq_us;          /**< Edge acquisition duration (capture start to end) in microseconds */
+    uint32_t windows;         /**< Number of hardware windows completed since `on_start` */
+} freq_window_stats_t;
+
+/**
+ * @brief Copy out the statistics of the last hardware capture window (test/diagnostic seam).
+ *
+ * @param[out] out_stats Destination structure.
+ */
+void tool_freq_get_last_window_stats(freq_window_stats_t *out_stats);
+
 #ifdef __cplusplus
 }
 #endif

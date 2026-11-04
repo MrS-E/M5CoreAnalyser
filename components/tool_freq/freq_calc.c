@@ -37,21 +37,36 @@ uint32_t freq_calc_gate_window_us(freq_gate_window_t gate)
             return 1000000U;
         default:
             return 0U;
+    }
 }
 
-bool freq_calc_cross_check(float f_period, float f_gate, uint64_t gate_edges, float *out_f_adjusted) {
-    if (gate_edges < 10U) {
-        return false;
+float freq_calc_cross_check_tolerance(uint64_t gate_counts)
+{
+    if (gate_counts == 0U) {
+        return 1.0f;
     }
-    if (f_gate <= 0.0f) {
-        return false;
+    float quant = FREQ_XCHECK_K_COUNTS / (float)gate_counts;
+    return (quant > FREQ_XCHECK_BASE_TOL) ? quant : FREQ_XCHECK_BASE_TOL;
+}
+
+freq_xcheck_t freq_calc_cross_check(const freq_period_result_t *period_res,
+                                    const freq_gate_result_t *gate_res,
+                                    float *out_rel_diff)
+{
+    if (out_rel_diff != NULL) {
+        *out_rel_diff = 0.0f;
     }
-    float diff = fabsf(f_period - f_gate);
-    if (diff / f_gate > 0.05f) {
-        *out_f_adjusted = f_gate;
-        return true;
+    if (period_res == NULL || gate_res == NULL || !period_res->valid || !gate_res->valid ||
+        !(period_res->freq_hz > 0.0f) || !(gate_res->freq_hz > 0.0f) ||
+        gate_res->pulse_count < FREQ_XCHECK_MIN_COUNTS) {
+        return FREQ_XCHECK_SKIPPED;
     }
-    return false;
+    float rel = fabsf(period_res->freq_hz - gate_res->freq_hz) / gate_res->freq_hz;
+    if (out_rel_diff != NULL) {
+        *out_rel_diff = rel;
+    }
+    return (rel > freq_calc_cross_check_tolerance(gate_res->pulse_count)) ? FREQ_XCHECK_MISMATCH
+                                                                         : FREQ_XCHECK_OK;
 }
 
 const char *freq_calc_gate_window_to_str(freq_gate_window_t gate)
@@ -401,14 +416,27 @@ esp_err_t freq_calc_combine_reading(freq_mode_t mode,
     out_reading->active_method = method;
     out_reading->hw_error = ESP_OK;
 
+    /* Cross-check 1/T against N/t_gate when both are valid and statistically meaningful. */
+    freq_xcheck_t xcheck = freq_calc_cross_check(period_res, gate_res, NULL);
+    out_reading->xcheck = xcheck;
+    bool mismatch = (xcheck == FREQ_XCHECK_MISMATCH);
+    if (mismatch) {
+        out_reading->unreliable = true;
+        /* Lost edges / glitches: trust the gate count unless the user forced 1/T mode. */
+        if (mode != FREQ_MODE_PERIOD_RMT) {
+            method = FREQ_METHOD_GATE;
+            out_reading->active_method = method;
+        }
+    }
+
     if (method == FREQ_METHOD_PERIOD && period_res != NULL && period_res->valid) {
         out_reading->signal_detected = true;
-        out_reading->duty_valid = true;
+        out_reading->duty_valid = !mismatch;
         out_reading->freq_hz = period_res->freq_hz;
         out_reading->period_us = period_res->period_us;
-        out_reading->pulse_width_us = period_res->pulse_width_us;
-        out_reading->low_width_us = period_res->low_width_us;
-        out_reading->duty_pct = period_res->duty_pct;
+        out_reading->pulse_width_us = mismatch ? NAN : period_res->pulse_width_us;
+        out_reading->low_width_us = mismatch ? NAN : period_res->low_width_us;
+        out_reading->duty_pct = mismatch ? NAN : period_res->duty_pct;
         out_reading->rpm = period_res->rpm;
         out_reading->edge_count = (gate_res != NULL && gate_res->pulse_count > 0U)
                                       ? gate_res->pulse_count
@@ -424,7 +452,7 @@ esp_err_t freq_calc_combine_reading(freq_mode_t mode,
         out_reading->edge_count = gate_res->pulse_count;
         out_reading->gate_duration_us = gate_res->gate_duration_us;
 
-        if (period_res != NULL && period_res->valid) {
+        if (period_res != NULL && period_res->valid && !mismatch) {
             out_reading->duty_valid = true;
             out_reading->duty_pct = period_res->duty_pct;
             out_reading->pulse_width_us = out_reading->period_us * (period_res->duty_pct / 100.0f);

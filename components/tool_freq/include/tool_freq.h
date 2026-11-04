@@ -43,6 +43,16 @@ extern "C" {
 #define FREQ_MAX_EDGE_DUTY_HZ           (25000.0f)  /**< Max frequency where 1 us GPIO ISR timestamps supply duty in AUTO mode */
 #define FREQ_SESSION_AVG_WINDOW         (16U)       /**< PSRAM session moving-average window length */
 #define FREQ_EDGE_RING_CAPACITY         (128U)      /**< Internal SRAM ISR ring capacity for GPIO edge timestamps (64 cycles) */
+#define FREQ_EDGE_ISR_MAX_INVOCATIONS   (512U)      /**< Hard cap on GPIO edge ISR entries per capture window (counts dropped same-level entries too) */
+#define FREQ_EDGE_ACQ_TARGET_EDGES      (5U)        /**< Edges (2 full periods) after which edge acquisition ends early */
+#define FREQ_EDGE_ACQ_MIN_EDGES         (3U)        /**< Minimum edges (1 full period) needed for a 1/T estimate */
+#define FREQ_EDGE_ACQ_DEFAULT_MAX_US    (2000000U)  /**< Default bounded edge acquisition time (independent of the PCNT gate) */
+#define FREQ_EDGE_ACQ_LIMIT_MAX_US      (2000000U)  /**< Largest configurable edge acquisition time */
+#define FREQ_EDGE_ACQ_LIMIT_MIN_US      (20000U)    /**< Smallest configurable edge acquisition time */
+#define FREQ_EDGE_POLL_MS               (5U)        /**< Cooperative cancellation poll interval during edge/gate waits */
+#define FREQ_XCHECK_BASE_TOL            (0.05f)     /**< Cross-check relative tolerance floor (5%) */
+#define FREQ_XCHECK_K_COUNTS            (3.0f)      /**< Cross-check quantisation allowance: tolerance >= K / N gate counts */
+#define FREQ_XCHECK_MIN_COUNTS          (8U)        /**< Fewer gate counts than this make the cross-check inconclusive (skipped) */
 #define FREQ_RMT_BOUNCE_SYMBOLS         (64U)       /**< Internal SRAM symbol capacity */
 #define FREQ_WORKER_STACK_BYTES         (6144U)     /**< Core 1 `freq_c1` worker task stack size in bytes */
 
@@ -128,10 +138,21 @@ typedef struct {
 } freq_gate_result_t;
 
 /**
+ * @brief Verdict of the 1/T edge-period versus PCNT gate-count cross-check.
+ */
+typedef enum {
+    FREQ_XCHECK_SKIPPED = 0,  /**< Inconclusive: a result is invalid or gate counts N < `FREQ_XCHECK_MIN_COUNTS` */
+    FREQ_XCHECK_OK,           /**< Both estimators agree within `max(5%, K/N)` */
+    FREQ_XCHECK_MISMATCH,     /**< Estimators disagree: edges were probably lost or glitches counted */
+} freq_xcheck_t;
+
+/**
  * @brief Combined frequency meter reading and session statistics.
  */
 typedef struct {
     bool signal_detected;     /**< True if a periodic signal was detected in the current window */
+    bool unreliable;          /**< True when the cross-check found a mismatch (duty is then unknown) */
+    freq_xcheck_t xcheck;     /**< Cross-check verdict for this reading */
     bool duty_valid;          /**< True if pulse_width_us, low_width_us, and duty_pct were measured; false (NaN) when only gate counts exist */
     freq_method_t active_method; /**< Active measurement method (`PERIOD`, `GATE`, or `NONE`) */
     esp_err_t hw_error;       /**< `ESP_OK` on normal operation, or ESP-IDF driver error if peripheral setup/capture failed */
@@ -244,15 +265,30 @@ esp_err_t freq_calc_from_edge_timestamps(const freq_edge_stamp_t *edges,
                                          freq_period_result_t *out_result);
 
 /**
- * @brief Cross-check frequency measurements between edge-period and gate-time.
+ * @brief Relative tolerance used by the cross-check: `max(5%, K / N)` with `K = FREQ_XCHECK_K_COUNTS`.
  *
- * @param f_period   Frequency calculated from period measurement (1/T).
- * @param f_gate     Frequency calculated from gate-time pulse counting (N/t).
- * @param gate_edges Pulse edges counted in the gate window.
- * @param out_f_adjusted Pointer to store the gate frequency if cross-check indicates unreliability.
- * @return True if cross-check fails (diff > 5% and gate_edges >= 10), marking duty as unreliable.
+ * The PCNT gate count has a +-1 count quantisation error, i.e. `1/N` relative, so a fixed 5%
+ * would wrongly reject correct readings at low counts.
+ *
+ * @param gate_counts Edges counted by PCNT in the gate window (`N`).
+ * @return Relative tolerance (`1.0f` when `gate_counts == 0`).
  */
-bool freq_calc_cross_check(float f_period, float f_gate, uint64_t gate_edges, float *out_f_adjusted);
+float freq_calc_cross_check_tolerance(uint64_t gate_counts);
+
+/**
+ * @brief Cross-check the edge-period (1/T) frequency against the PCNT gate frequency.
+ *
+ * Only conclusive when both results are valid with `freq_hz > 0` and the gate counted at least
+ * `FREQ_XCHECK_MIN_COUNTS` edges; otherwise returns `FREQ_XCHECK_SKIPPED`.
+ *
+ * @param[in]  period_res   Edge-period result (may be NULL).
+ * @param[in]  gate_res     PCNT gate result (may be NULL).
+ * @param[out] out_rel_diff Optional relative difference `|fp - fg| / fg` (0 when skipped).
+ * @return `FREQ_XCHECK_OK`, `FREQ_XCHECK_MISMATCH` or `FREQ_XCHECK_SKIPPED`.
+ */
+freq_xcheck_t freq_calc_cross_check(const freq_period_result_t *period_res,
+                                    const freq_gate_result_t *gate_res,
+                                    float *out_rel_diff);
 
 /**
  * @brief Return the maximum 50%-duty signal frequency in Hz permitted by a PCNT glitch filter setting.
@@ -441,6 +477,25 @@ esp_err_t tool_freq_set_pcnt_glitch_ns(uint32_t max_glitch_ns);
  * @return Glitch filter threshold in nanoseconds (`25` by default).
  */
 uint32_t tool_freq_get_pcnt_glitch_ns(void);
+
+/**
+ * @brief Set the maximum edge-acquisition time used by the 1/T estimator (independent of the PCNT gate).
+ *
+ * After the PCNT gate closes, edge capture continues (polling every `FREQ_EDGE_POLL_MS`, so stop and
+ * hold stay responsive) until `FREQ_EDGE_ACQ_TARGET_EDGES` edges are stored, the ISR invocation cap
+ * is hit, or this time (measured from capture start) elapses. Default `FREQ_EDGE_ACQ_DEFAULT_MAX_US` (2 s).
+ *
+ * @param[in] max_us Limit in microseconds (`FREQ_EDGE_ACQ_LIMIT_MIN_US..FREQ_EDGE_ACQ_LIMIT_MAX_US`).
+ * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` if out of range.
+ */
+esp_err_t tool_freq_set_edge_acq_max_us(uint32_t max_us);
+
+/**
+ * @brief Get the maximum edge-acquisition time in microseconds.
+ *
+ * @return Current limit (`2000000` by default).
+ */
+uint32_t tool_freq_get_edge_acq_max_us(void);
 
 /**
  * @brief Pause or resume frequency measurement updates (`HOLD` / `RUN`).
