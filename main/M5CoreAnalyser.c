@@ -3,6 +3,8 @@
 #include "bsp_m5core2.h"
 #include "recorder_sink.h"
 #include "tool_core.h"
+#include "tool_freq.h"
+#include "tool_logic.h"
 #include "tool_scope.h"
 #include "tool_voltmeter.h"
 #include "ui_shell.h"
@@ -19,6 +21,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(tool_voltmeter_register());
     ESP_ERROR_CHECK(tool_scope_register());
+    ESP_ERROR_CHECK(tool_logic_register());
+    ESP_ERROR_CHECK(tool_freq_register());
 
     err = ui_shell_init();
     if (err == ESP_OK) {

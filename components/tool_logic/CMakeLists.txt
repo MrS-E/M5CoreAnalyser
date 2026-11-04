@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "tool_logic.c"
+        "logic_decoders.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        bsp_m5core2
+        tool_core
+        recorder_sink
+        lvgl
+        esp_driver_rmt
+        esp_driver_gptimer
+        esp_driver_gpio
+        soc
+        esp_timer
+        heap
+        freertos
+        log
+)
