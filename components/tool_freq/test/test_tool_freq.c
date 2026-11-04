@@ -469,3 +469,12 @@ TEST_CASE("given real hardware capture path without source injection when contin
     (void)tool_freq_set_pin(BSP_PIN_ANALOG_IN_DEFAULT);
     (void)tool_freq_set_gate_window(FREQ_GATE_100MS);
 }
+
+TEST_CASE("given cross-check scenario when period and gate frequencies differ significantly then duty is invalidated", "[tool_freq][cross_check]")
+{
+    freq_period_result_t pres = {.valid = true, .freq_hz = 100.0f};
+    freq_gate_result_t gres = {.valid = true, .freq_hz = 105.0f, .pulse_count = 100ULL};
+    float adjusted_freq = 0.0f;
+    TEST_ASSERT_TRUE(freq_calc_cross_check(pres.freq_hz, gres.freq_hz, gres.pulse_count, &adjusted_freq));
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 105.0f, adjusted_freq);
+}
