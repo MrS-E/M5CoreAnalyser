@@ -1,0 +1,320 @@
+/**
+ * @file test_tool_freq.c
+ * @brief Unity unit & integration tests for `tool_freq`: RMT RX period/duty calculation,
+ *        PCNT gate-time pulse counting, 5 kHz crossover hysteresis, zero-edge timeout,
+ *        PSRAM session tracking, recorder sink export, and cooperative gate cancellation.
+ */
+
+#include <math.h>
+#include <string.h>
+
+#include "bsp_m5core2.h"
+#include "bsp_m5core2_priv.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "recorder_sink.h"
+#include "recorder_sink_priv.h"
+#include "tool_core.h"
+#include "tool_core_priv.h"
+#include "tool_freq.h"
+#include "tool_freq_priv.h"
+#include "ui_shell.h"
+#include "unity.h"
+
+typedef struct {
+    rmt_symbol_word_t symbols[16];
+    size_t num_symbols;
+    uint64_t pcnt_pulses;
+    uint64_t actual_gate_us;
+    freq_pcnt_edge_mode_t edge_mode;
+} synth_freq_ctx_t;
+
+static esp_err_t synth_freq_source_cb(gpio_num_t pin,
+                                      uint32_t gate_window_us,
+                                      rmt_symbol_word_t *out_symbols,
+                                      size_t max_symbols,
+                                      size_t *out_num_symbols,
+                                      uint64_t *out_pcnt_pulses,
+                                      uint64_t *out_actual_gate_us,
+                                      freq_pcnt_edge_mode_t *out_edge_mode,
+                                      void *user_ctx)
+{
+    (void)pin;
+    const synth_freq_ctx_t *ctx = (const synth_freq_ctx_t *)user_ctx;
+    size_t n = (ctx->num_symbols > max_symbols) ? max_symbols : ctx->num_symbols;
+    if (n > 0U && out_symbols != NULL) {
+        memcpy(out_symbols, ctx->symbols, n * sizeof(rmt_symbol_word_t));
+    }
+    *out_num_symbols = n;
+    *out_pcnt_pulses = ctx->pcnt_pulses;
+    *out_actual_gate_us = (ctx->actual_gate_us > 0U) ? ctx->actual_gate_us : gate_window_us;
+    *out_edge_mode = ctx->edge_mode;
+    return ESP_OK;
+}
+
+TEST_CASE("given RMT RX symbols with servo PWM and glitch pulses when period is calculated then frequency duty pulse width and RPM are exact", "[tool_freq][period]")
+{
+    /* 1. 50 Hz servo signal (1500 us high, 18500 us low -> T = 20,000 us, f = 50.0 Hz, Duty = 7.5%, RPM = 3000) */
+    rmt_symbol_word_t servo_syms[3];
+    for (size_t i = 0; i < 3; ++i) {
+        servo_syms[i].duration0 = 1500U;
+        servo_syms[i].level0 = 1U;
+        servo_syms[i].duration1 = 18500U;
+        servo_syms[i].level1 = 0U;
+    }
+
+    freq_period_result_t res = {0};
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_from_rmt_symbols(servo_syms, 3, 1000000U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_EQUAL_UINT32(3U, res.cycles_measured);
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 50.0f, res.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 20000.0f, res.period_us);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 1500.0f, res.pulse_width_us);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 18500.0f, res.low_width_us);
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 7.5f, res.duty_pct);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 3000.0f, res.rpm);
+
+    /* 2. Glitch filtering & same-level coalescing at 10 MHz (100 ns/tick):
+     *    High 100 us (1000 ticks), glitch low 200 ns (2 ticks < 1000 ns), High 150 us (1500 ticks) -> coalesced 250 us high
+     *    Low 750 us (7500 ticks) -> T = 1000 us (1 kHz), Duty = 25% */
+    rmt_symbol_word_t glitch_syms[2] = {
+        {.duration0 = 1000U, .level0 = 1U, .duration1 = 2U, .level1 = 0U},
+        {.duration0 = 1500U, .level0 = 1U, .duration1 = 7500U, .level1 = 0U},
+    };
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_from_rmt_symbols(glitch_syms, 2, 10000000U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, res.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 250.0f, res.pulse_width_us);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 750.0f, res.low_width_us);
+    TEST_ASSERT_FLOAT_WITHIN(0.2f, 25.0f, res.duty_pct);
+
+    /* 3. Zero-edge / idle timeout symbols -> valid == false, 0.0 Hz */
+    rmt_symbol_word_t empty_sym = {.val = 0U};
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_from_rmt_symbols(&empty_sym, 1, 1000000U, 1000U, &res));
+    TEST_ASSERT_FALSE(res.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, res.freq_hz);
+}
+
+TEST_CASE("given PCNT gate pulse counts across 20ms 100ms and 1000ms windows when calculated then high frequency and zero-edge timeout are accurate", "[tool_freq][gate]")
+{
+    freq_gate_result_t gres = {0};
+
+    /* 1. 4.000 MHz signal over 100 ms gate (800,000 rising+falling edges in 100,000 us) */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_from_gate_counts(800000ULL, 100000ULL, FREQ_PCNT_EDGES_BOTH, &gres));
+    TEST_ASSERT_TRUE(gres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 4000000.0f, gres.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.25f, gres.period_us);
+
+    /* 2. 12.345 kHz signal over 1000 ms gate (12,345 rising edges in 1,000,000 us) */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_from_gate_counts(12345ULL, 1000000ULL, FREQ_PCNT_EDGES_RISING_ONLY, &gres));
+    TEST_ASSERT_TRUE(gres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 12345.0f, gres.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 740700.0f, gres.rpm);
+
+    /* 3. Zero-edge timeout -> valid == false, 0.0 Hz */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_from_gate_counts(0ULL, 100000ULL, FREQ_PCNT_EDGES_BOTH, &gres));
+    TEST_ASSERT_FALSE(gres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, gres.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, gres.period_us);
+
+    /* 4. Invalid gate_duration_us == 0 -> ESP_ERR_INVALID_ARG */
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      freq_calc_from_gate_counts(100ULL, 0ULL, FREQ_PCNT_EDGES_BOTH, &gres));
+}
+
+TEST_CASE("given frequencies sweeping across 4.5kHz to 5.5kHz when AUTO mode selects method then hysteresis prevents chatter and tracker preserves stats on timeout", "[tool_freq][crossover]")
+{
+    freq_session_tracker_t tracker = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_tracker_init(&tracker, 8U));
+
+    freq_period_result_t pres = {.valid = true, .freq_hz = 1000.0f, .period_us = 1000.0f,
+                                 .pulse_width_us = 300.0f, .low_width_us = 700.0f,
+                                 .duty_pct = 30.0f, .rpm = 60000.0f, .cycles_measured = 10U};
+    freq_gate_result_t gres = {.valid = true, .freq_hz = 1000.0f, .period_us = 1000.0f,
+                               .rpm = 60000.0f, .pulse_count = 200ULL, .gate_duration_us = 100000ULL};
+    freq_reading_t reading = {0};
+
+    /* 1. At 1.0 kHz and 5.2 kHz (below 5.5 kHz upper threshold), stays in PERIOD */
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_combine_reading(FREQ_MODE_AUTO, FREQ_METHOD_NONE, &pres, &gres, &tracker, &reading));
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 1000.0f, reading.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 30.0f, reading.duty_pct);
+
+    pres.freq_hz = 5200.0f;
+    gres.freq_hz = 5200.0f;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_combine_reading(FREQ_MODE_AUTO, reading.active_method, &pres, &gres, &tracker, &reading));
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+
+    /* 2. At 6.0 kHz (> 5.5 kHz), crosses over to GATE while retaining RMT duty cycle */
+    pres.freq_hz = 6000.0f;
+    pres.duty_pct = 40.0f;
+    gres.freq_hz = 6000.0f;
+    gres.period_us = 1000000.0f / 6000.0f;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_combine_reading(FREQ_MODE_AUTO, reading.active_method, &pres, &gres, &tracker, &reading));
+    TEST_ASSERT_EQUAL(FREQ_METHOD_GATE, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 6000.0f, reading.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 40.0f, reading.duty_pct);
+
+    /* 3. Dropping to 4.8 kHz (inside 4.5..5.5 kHz hysteresis band) remains in GATE */
+    pres.freq_hz = 4800.0f;
+    gres.freq_hz = 4800.0f;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_combine_reading(FREQ_MODE_AUTO, reading.active_method, &pres, &gres, &tracker, &reading));
+    TEST_ASSERT_EQUAL(FREQ_METHOD_GATE, reading.active_method);
+
+    /* 4. Dropping to 4.2 kHz (< 4.5 kHz lower threshold) switches back to PERIOD */
+    pres.freq_hz = 4200.0f;
+    gres.freq_hz = 4200.0f;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_combine_reading(FREQ_MODE_AUTO, reading.active_method, &pres, &gres, &tracker, &reading));
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+
+    /* 5. Zero-edge timeout zeroes live reading while preserving session min/max/avg */
+    pres.valid = false;
+    gres.valid = false;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      freq_calc_combine_reading(FREQ_MODE_AUTO, reading.active_method, &pres, &gres, &tracker, &reading));
+    TEST_ASSERT_FALSE(reading.signal_detected);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_NONE, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, reading.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, reading.fmin_hz);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 6000.0f, reading.fmax_hz);
+
+    /* 6. Auto-ranging formatter */
+    char buf[32];
+    freq_calc_format_freq(0.0f, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_STRING("0.00 Hz", buf);
+    freq_calc_format_freq(440.25f, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_STRING("440.25 Hz", buf);
+    freq_calc_format_freq(12500.0f, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_STRING("12.500 kHz", buf);
+    freq_calc_format_freq(2500000.0f, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_STRING("2.500 MHz", buf);
+
+    freq_calc_tracker_free(&tracker);
+}
+
+TEST_CASE("given registered tool_freq when started configured and stepped then UI pin ownership and recorder export work", "[tool_freq][lifecycle]")
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_pin(BSP_PIN_ANALOG_IN_DEFAULT));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_mode(FREQ_MODE_AUTO));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_gate_window(FREQ_GATE_20MS));
+
+    synth_freq_ctx_t fctx = {
+        .num_symbols = 2U,
+        .pcnt_pulses = 40ULL,
+        .actual_gate_us = 20000ULL,
+        .edge_mode = FREQ_PCNT_EDGES_BOTH,
+    };
+    /* 1 kHz 25% duty (250 us high, 750 us low) */
+    for (size_t i = 0; i < 2U; ++i) {
+        fctx.symbols[i].duration0 = 250U;
+        fctx.symbols[i].level0 = 1U;
+        fctx.symbols[i].duration1 = 750U;
+        fctx.symbols[i].level1 = 0U;
+    }
+    tool_freq_set_capture_source(synth_freq_source_cb, &fctx);
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_register());
+    size_t passed = 0, failed = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_run_selftests(&passed, &failed));
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)failed);
+
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(FREQ_TOOL_ID));
+    TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, FREQ_TOOL_ID));
+
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_set_mode(REC_MODE_USB_STUB));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_run_single_step());
+    ui_shell_step();
+
+    freq_reading_t reading = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_get_latest_reading(&reading));
+    TEST_ASSERT_TRUE(reading.signal_detected);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, reading.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 25.0f, reading.duty_pct);
+
+    recorder_sink_stats_t rstats = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1U, rstats.frames_pushed);
+    TEST_ASSERT_EQUAL_STRING(FREQ_TOOL_ID, rstats.last_tool_id);
+
+    /* Switch to high-frequency 250 kHz PCNT gate signal (10,000 both-edges in 20,000 us) */
+    fctx.num_symbols = 0U;
+    fctx.pcnt_pulses = 10000ULL;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_run_single_step());
+    ui_shell_step();
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_get_latest_reading(&reading));
+    TEST_ASSERT_TRUE(reading.signal_detected);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_GATE, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(10.0f, 250000.0f, reading.freq_hz);
+
+    /* Pin switch to GPIO13 and conflict rejection against a background generator on GPIO14 */
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_pin_claim(BSP_PIN_PORT_C_TXD2, "wavegen"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, tool_freq_set_pin(BSP_PIN_PORT_C_TXD2));
+    TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, FREQ_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_pin(BSP_PIN_PORT_C_RXD2));
+    TEST_ASSERT_TRUE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_RXD2, FREQ_TOOL_ID));
+    TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, FREQ_TOOL_ID));
+    (void)bsp_pin_release(BSP_PIN_PORT_C_TXD2, "wavegen");
+
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_RXD2, FREQ_TOOL_ID));
+
+    tool_freq_set_capture_source(NULL, NULL);
+    (void)tool_freq_set_pin(BSP_PIN_ANALOG_IN_DEFAULT);
+}
+
+TEST_CASE("given real hardware capture path without source injection when gated and stopped on 1000ms gate then timeout and worker stop are clean", "[tool_freq][hardware][lifecycle]")
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+    tool_freq_set_capture_source(NULL, NULL);
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_pin(BSP_PIN_ANALOG_IN_DEFAULT));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_gate_window(FREQ_GATE_20MS));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_register());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(FREQ_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_run_single_step());
+
+    freq_reading_t reading = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_get_latest_reading(&reading));
+    TEST_ASSERT_FALSE(reading.signal_detected);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, reading.freq_hz);
+
+    /* Switch to 1000 ms gate window, let worker enter gate wait, then stop immediately */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_gate_window(FREQ_GATE_1000MS));
+    vTaskDelay(pdMS_TO_TICKS(25));
+
+    int64_t stop_start_us = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    int64_t stop_elapsed_us = esp_timer_get_time() - stop_start_us;
+    TEST_ASSERT_LESS_THAN_INT32(250000, (int32_t)stop_elapsed_us);
+    TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_ANALOG_IN_DEFAULT, FREQ_TOOL_ID));
+    TEST_ASSERT_TRUE(heap_caps_check_integrity_all(true));
+
+    (void)tool_freq_set_gate_window(FREQ_GATE_100MS);
+}
