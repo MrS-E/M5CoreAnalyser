@@ -51,6 +51,14 @@ uint32_t logic_effective_sample_rate_hz(logic_capture_mode_t mode, logic_sample_
     return logic_sample_rate_to_hz(clamped);
 }
 
+bool logic_capture_mode_channel_available(logic_capture_mode_t mode, uint8_t channel)
+{
+    if (mode < 0 || mode >= LOGIC_CAP_MODE_COUNT || channel >= LOGIC_CHANNEL_COUNT) {
+        return false;
+    }
+    return mode != LOGIC_CAP_MODE_RMT_EDGE || channel == 0U;
+}
+
 esp_err_t logic_edge_timestamps_to_rmt_symbols(const logic_edge_sample_t *edges,
                                                size_t edge_count,
                                                rmt_symbol_word_t *out_symbols,

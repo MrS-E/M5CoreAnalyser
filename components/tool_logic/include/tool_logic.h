@@ -300,6 +300,17 @@ logic_sample_rate_t logic_clamp_sample_rate(logic_capture_mode_t mode, logic_sam
 uint32_t logic_effective_sample_rate_hz(logic_capture_mode_t mode, logic_sample_rate_t rate);
 
 /**
+ * @brief Return whether a channel has real signal data in the selected capture mode.
+ *
+ * `LOGIC_CAP_MODE_RMT_EDGE` captures only CH0; CH1..CH3 are unavailable rather than low.
+ *
+ * @param[in] mode Capture mode.
+ * @param[in] channel Channel index (`0..LOGIC_CHANNEL_COUNT-1`).
+ * @return True when the channel is captured, false for invalid inputs or unavailable channels.
+ */
+bool logic_capture_mode_channel_available(logic_capture_mode_t mode, uint8_t channel);
+
+/**
  * @brief Convert an array of GPIO edge transition timestamps (`1 us` resolution) into ESP32 RMT symbol words.
  *
  * Rejects duplicate-level or zero-duration glitches and packs consecutive pulse durations (`t[k+1] - t[k]`,

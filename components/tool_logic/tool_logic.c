@@ -1221,7 +1221,9 @@ static esp_err_t logic_worker_step_locked(bool is_bg_worker)
             wptr->no_capture = true;
             (void)snprintf(wptr->decoded.summary,
                            sizeof(wptr->decoded.summary),
-                           "RMT EDGE: No transitions captured");
+                           "%s: No %s captured",
+                           (cap_mode == LOGIC_CAP_MODE_RMT_EDGE) ? "RMT EDGE" : "SAMPLED",
+                           (cap_mode == LOGIC_CAP_MODE_RMT_EDGE) ? "transitions" : "samples");
         } else {
             bool triggered = false;
             size_t trig_idx = 0U;
@@ -1699,7 +1701,11 @@ static void logic_on_ui_refresh(void *ctx)
     for (uint8_t c = 0U; c < LOGIC_CHANNEL_COUNT; ++c) {
         gpio_num_t pin = tool_logic_get_channel_pin(c);
         if (s_lbl_ch_pins[c] != NULL) {
-            lv_label_set_text_fmt(s_lbl_ch_pins[c], "C%u:G%d", (unsigned)c, (int)pin);
+            if (logic_capture_mode_channel_available(s_ui_frame.cap_mode, c)) {
+                lv_label_set_text_fmt(s_lbl_ch_pins[c], "C%u:G%d", (unsigned)c, (int)pin);
+            } else {
+                lv_label_set_text_fmt(s_lbl_ch_pins[c], "C%u:N/A", (unsigned)c);
+            }
         }
         if (s_modal_ch_lbl[c] != NULL) {
             lv_label_set_text_fmt(s_modal_ch_lbl[c], "C%u:G%d", (unsigned)c, (int)pin);
@@ -1717,7 +1723,7 @@ static void logic_on_ui_refresh(void *ctx)
             }
             int32_t *pts = lv_chart_get_y_array(s_chart, s_ser_ch[c]);
             if (pts != NULL) {
-                if (hide_waveform) {
+                if (hide_waveform || !logic_capture_mode_channel_available(s_ui_frame.cap_mode, c)) {
                     for (size_t i = 0; i < LOGIC_VIEW_POINTS; ++i) {
                         pts[i] = LV_CHART_POINT_NONE;
                     }
@@ -1747,7 +1753,10 @@ static void logic_on_ui_refresh(void *ctx)
         if (s_ui_frame.hw_error != ESP_OK) {
             lv_label_set_text(s_lbl_decode_rows, "Capture aborted due to hardware/timer error");
         } else if (s_ui_frame.no_capture) {
-            lv_label_set_text(s_lbl_decode_rows, "No edge transitions captured (idle line)");
+            lv_label_set_text(s_lbl_decode_rows,
+                              (s_ui_frame.cap_mode == LOGIC_CAP_MODE_RMT_EDGE)
+                                  ? "No edge transitions captured (idle line)"
+                                  : "No sampled data captured");
         } else if (s_ui_frame.decoded.row_count == 0U) {
             lv_label_set_text(s_lbl_decode_rows, "No decoded frames in buffer");
         } else {
