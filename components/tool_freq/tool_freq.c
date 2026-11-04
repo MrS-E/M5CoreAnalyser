@@ -761,7 +761,13 @@ static esp_err_t capture_freq_window(gpio_num_t pin,
         return err;
     }
 
-    bool ok = wait_gate_or_abort(start_us + (int64_t)gate_window_us, start_seq, is_bg_worker);
+    /* If frequency is very low, wait up to 2 seconds for edges, otherwise gate. */
+    int64_t capture_deadline_us = start_us + (int64_t)gate_window_us;
+    if (prev_method == FREQ_METHOD_PERIOD && s_latest_reading.freq_hz > 0.0f && s_latest_reading.freq_hz < 10.0f) {
+        capture_deadline_us = start_us + 2000000LL;
+    }
+
+    bool ok = wait_gate_or_abort(capture_deadline_us, start_seq, is_bg_worker);
 
     if (s_pcnt_gate_running) {
         (void)pcnt_unit_stop(s_pcnt_unit);
@@ -924,6 +930,15 @@ static esp_err_t freq_worker_step_locked(bool is_bg_worker)
 
     freq_reading_t reading = {0};
     (void)freq_calc_combine_reading(mode, prev_method, &period_res, &gate_res, &s_tracker, &reading);
+
+    /* Cross-check gate vs period for reliability: if significant discrepancy, invalidate duty cycle. */
+    float adjusted_freq = 0.0f;
+    if (freq_calc_cross_check(period_res.freq_hz, gate_res.freq_hz, gate_res.pulse_count, &adjusted_freq)) {
+        reading.duty_valid = false;
+        reading.pulse_width_us = NAN;
+        reading.low_width_us = NAN;
+        reading.duty_pct = NAN;
+    }
 
     if (recorder_sink_is_recording()) {
         uint32_t update_rate_hz = (actual_gate_us > 0U && actual_gate_us <= 1000000ULL)

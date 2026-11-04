@@ -37,7 +37,21 @@ uint32_t freq_calc_gate_window_us(freq_gate_window_t gate)
             return 1000000U;
         default:
             return 0U;
+}
+
+bool freq_calc_cross_check(float f_period, float f_gate, uint64_t gate_edges, float *out_f_adjusted) {
+    if (gate_edges < 10U) {
+        return false;
     }
+    if (f_gate <= 0.0f) {
+        return false;
+    }
+    float diff = fabsf(f_period - f_gate);
+    if (diff / f_gate > 0.05f) {
+        *out_f_adjusted = f_gate;
+        return true;
+    }
+    return false;
 }
 
 const char *freq_calc_gate_window_to_str(freq_gate_window_t gate)

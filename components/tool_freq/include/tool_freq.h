@@ -244,6 +244,17 @@ esp_err_t freq_calc_from_edge_timestamps(const freq_edge_stamp_t *edges,
                                          freq_period_result_t *out_result);
 
 /**
+ * @brief Cross-check frequency measurements between edge-period and gate-time.
+ *
+ * @param f_period   Frequency calculated from period measurement (1/T).
+ * @param f_gate     Frequency calculated from gate-time pulse counting (N/t).
+ * @param gate_edges Pulse edges counted in the gate window.
+ * @param out_f_adjusted Pointer to store the gate frequency if cross-check indicates unreliability.
+ * @return True if cross-check fails (diff > 5% and gate_edges >= 10), marking duty as unreliable.
+ */
+bool freq_calc_cross_check(float f_period, float f_gate, uint64_t gate_edges, float *out_f_adjusted);
+
+/**
  * @brief Return the maximum 50%-duty signal frequency in Hz permitted by a PCNT glitch filter setting.
  *
  * At `glitch_ns == 25` (2 APB cycles @ 80 MHz), returns `20,000,000.0f` (`20 MHz`).
