@@ -388,3 +388,410 @@ TEST_CASE("given registered tool_logic when started configured and stepped then 
 
     (void)tool_logic_set_sample_rate(LOGIC_RATE_100KHZ);
 }
+
+TEST_CASE("given sample rate presets and edge timestamps when clamped and converted then rate caps and RMT symbols are accurate", "[tool_logic][decoders]")
+{
+    /* 1. Sampled mode clamps presets above 100 kHz to 100 kHz */
+    TEST_ASSERT_EQUAL(LOGIC_RATE_10KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_10KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_50KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_50KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_100KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_100KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_100KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_250KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_100KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_500KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_100KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_1MHZ));
+
+    TEST_ASSERT_EQUAL_UINT32(10000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_10KHZ));
+    TEST_ASSERT_EQUAL_UINT32(50000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_50KHZ));
+    TEST_ASSERT_EQUAL_UINT32(100000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_100KHZ));
+    TEST_ASSERT_EQUAL_UINT32(100000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_250KHZ));
+    TEST_ASSERT_EQUAL_UINT32(100000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_500KHZ));
+    TEST_ASSERT_EQUAL_UINT32(100000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_1MHZ));
+
+    /* 2. RMT_EDGE mode allows all presets up to 1 MHz */
+    TEST_ASSERT_EQUAL(LOGIC_RATE_250KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_RMT_EDGE, LOGIC_RATE_250KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_500KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_RMT_EDGE, LOGIC_RATE_500KHZ));
+    TEST_ASSERT_EQUAL(LOGIC_RATE_1MHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_RMT_EDGE, LOGIC_RATE_1MHZ));
+    TEST_ASSERT_EQUAL_UINT32(1000000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_RMT_EDGE, LOGIC_RATE_1MHZ));
+    TEST_ASSERT_EQUAL_UINT32(0U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_COUNT));
+
+    /* 3. Continuous edge timestamps -> RMT symbols with duplicate-level & 0-us glitch rejection */
+    logic_edge_sample_t edges[12];
+    size_t n = 0U;
+    uint32_t t = 1000U;
+    for (int cyc = 0; cyc < 4; ++cyc) {
+        edges[n].timestamp_us = t;
+        edges[n].level = 1U;
+        n++;
+        if (cyc == 1) {
+            /* Inject zero-duration glitch at `t` and duplicate-level bounce at `t + 5` */
+            edges[n].timestamp_us = t;
+            edges[n].level = 0U;
+            n++;
+            edges[n].timestamp_us = t;
+            edges[n].level = 1U;
+            n++;
+            edges[n].timestamp_us = t + 5U;
+            edges[n].level = 1U;
+            n++;
+        }
+        t += 250U;
+        edges[n].timestamp_us = t;
+        edges[n].level = 0U;
+        n++;
+        t += 750U;
+    }
+    edges[n].timestamp_us = t;
+    edges[n].level = 1U;
+    n++;
+
+    rmt_symbol_word_t syms[16] = {0};
+    size_t sym_cnt = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, logic_edge_timestamps_to_rmt_symbols(edges, n, syms, 16U, &sym_cnt));
+    TEST_ASSERT_EQUAL_UINT32(4U, (uint32_t)sym_cnt);
+
+    uint8_t buf[512] = {0};
+    size_t written = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      logic_expand_rmt_to_samples(syms, sym_cnt, 1000000U, 100000U, 0U, buf, sizeof(buf), &written));
+    TEST_ASSERT_EQUAL_UINT32(400U, (uint32_t)written);
+
+    logic_pwm_result_t pres = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, logic_decode_pwm(buf, written, 100000U, 0U, &pres));
+    TEST_ASSERT_TRUE(pres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(10.0f, 1000.0f, pres.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(1.5f, 25.0f, pres.duty_pct);
+
+    /* 4. Long pulse (> 32767 us) splitting across RMT half-words and < 2 edge handling */
+    logic_edge_sample_t long_edges[2] = {
+        {.timestamp_us = 100U, .level = 1U},
+        {.timestamp_us = 50100U, .level = 0U},
+    };
+    TEST_ASSERT_EQUAL(ESP_OK, logic_edge_timestamps_to_rmt_symbols(long_edges, 2U, syms, 16U, &sym_cnt));
+    TEST_ASSERT_EQUAL_UINT32(1U, (uint32_t)sym_cnt);
+    TEST_ASSERT_EQUAL_UINT32(32767U, (uint32_t)syms[0].duration0);
+    TEST_ASSERT_EQUAL_UINT32(17233U, (uint32_t)syms[0].duration1);
+    TEST_ASSERT_EQUAL_UINT32(1U, (uint32_t)syms[0].level0);
+    TEST_ASSERT_EQUAL_UINT32(1U, (uint32_t)syms[0].level1);
+
+    TEST_ASSERT_EQUAL(ESP_OK, logic_edge_timestamps_to_rmt_symbols(long_edges, 1U, syms, 16U, &sym_cnt));
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)sym_cnt);
+}
+
+static uint8_t IRAM_ATTR test_isr_square_wave_cb(size_t sample_idx, int64_t now_us, void *user_ctx)
+{
+    (void)now_us;
+    uint32_t *counter = (uint32_t *)user_ctx;
+    if (counter != NULL) {
+        (*counter)++;
+    }
+    /* 8-sample period on CH0 (4 High, 4 Low = 50% duty cycle) */
+    return ((sample_idx & 7U) < 4U) ? 0x01U : 0x00U;
+}
+
+TEST_CASE("given sampled mode at 10kHz 50kHz 100kHz and capped 250kHz-1MHz when stepped then real GPTimer ISR fires and measures rate", "[tool_logic][sampled_rate]")
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_register());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+
+    tool_logic_set_capture_source(NULL, NULL);
+    tool_logic_force_gptimer_timeout_for_test(false);
+    uint32_t cb_calls = 0U;
+    tool_logic_set_isr_sample_cb_for_test(test_isr_square_wave_cb, &cb_calls);
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_capture_mode(LOGIC_CAP_MODE_SAMPLED));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_protocol(LOGIC_PROTO_PWM));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(LOGIC_RATE_100KHZ));
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(LOGIC_TOOL_ID));
+    /* Pause background worker so synchronous steps have exclusive timer access */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    static logic_frame_t frame;
+    logic_window_stats_t stats = {0};
+
+    /* 1. 10 kHz sampled capture (1024 samples * 100 us = ~102.3 ms) */
+    cb_calls = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(LOGIC_RATE_10KHZ));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    tool_logic_get_last_window_stats(&stats);
+    TEST_ASSERT_EQUAL(ESP_OK, frame.hw_error);
+    TEST_ASSERT_FALSE(frame.no_capture);
+    TEST_ASSERT_FALSE(frame.rate_capped);
+    TEST_ASSERT_EQUAL_UINT32(10000U, frame.requested_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(10000U, frame.effective_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(LOGIC_DEFAULT_CAPTURE_SAMPLES, (uint32_t)frame.total_captured);
+    TEST_ASSERT_EQUAL_UINT32(LOGIC_DEFAULT_CAPTURE_SAMPLES, stats.gptimer_isr_count);
+    TEST_ASSERT_EQUAL_UINT32(0U, stats.bounce_overruns);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(LOGIC_DEFAULT_CAPTURE_SAMPLES, cb_calls);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(70000U, frame.capture_elapsed_us);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(220000U, frame.capture_elapsed_us);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(4500U, frame.sample_rate_hz);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(14500U, frame.sample_rate_hz);
+    TEST_ASSERT_TRUE(frame.decoded.pwm.valid);
+    TEST_ASSERT_FLOAT_WITHIN(2.0f, 50.0f, frame.decoded.pwm.duty_pct);
+
+    /* 2. 50 kHz sampled capture (1024 samples * 20 us = ~20.5 ms) */
+    cb_calls = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(LOGIC_RATE_50KHZ));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    tool_logic_get_last_window_stats(&stats);
+    TEST_ASSERT_EQUAL(ESP_OK, frame.hw_error);
+    TEST_ASSERT_FALSE(frame.rate_capped);
+    TEST_ASSERT_EQUAL_UINT32(50000U, frame.requested_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(50000U, frame.effective_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(LOGIC_DEFAULT_CAPTURE_SAMPLES, stats.gptimer_isr_count);
+    TEST_ASSERT_EQUAL_UINT32(0U, stats.bounce_overruns);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(12000U, frame.capture_elapsed_us);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, frame.sample_rate_hz);
+
+    /* 3. 100 kHz sampled capture (1024 samples * 10 us = ~10.2 ms) */
+    cb_calls = 0U;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(LOGIC_RATE_100KHZ));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    tool_logic_get_last_window_stats(&stats);
+    TEST_ASSERT_EQUAL(ESP_OK, frame.hw_error);
+    TEST_ASSERT_FALSE(frame.rate_capped);
+    TEST_ASSERT_EQUAL_UINT32(100000U, frame.requested_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(100000U, frame.effective_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(LOGIC_DEFAULT_CAPTURE_SAMPLES, stats.gptimer_isr_count);
+    TEST_ASSERT_EQUAL_UINT32(0U, stats.bounce_overruns);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(5000U, frame.capture_elapsed_us);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, frame.sample_rate_hz);
+
+    /* 4. Presets > 100 kHz (250 kHz, 500 kHz, 1 MHz) are capped to 100 kHz and report measured rate to recorder */
+    const logic_sample_rate_t high_rates[] = {LOGIC_RATE_250KHZ, LOGIC_RATE_500KHZ, LOGIC_RATE_1MHZ};
+    const uint32_t req_hz[] = {250000U, 500000U, 1000000U};
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_set_mode(REC_MODE_USB_STUB));
+
+    for (size_t i = 0; i < 3U; ++i) {
+        recorder_sink_test_reset();
+        TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+        TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_set_mode(REC_MODE_USB_STUB));
+
+        TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(high_rates[i]));
+        TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+        TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+        TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+        ui_shell_step();
+
+        TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+        tool_logic_get_last_window_stats(&stats);
+        TEST_ASSERT_EQUAL(ESP_OK, frame.hw_error);
+        TEST_ASSERT_TRUE(frame.rate_capped);
+        TEST_ASSERT_EQUAL_UINT32(req_hz[i], frame.requested_rate_hz);
+        TEST_ASSERT_EQUAL_UINT32(LOGIC_SAMPLED_MAX_RATE_HZ, frame.effective_rate_hz);
+        TEST_ASSERT_EQUAL_UINT32(LOGIC_DEFAULT_CAPTURE_SAMPLES, stats.gptimer_isr_count);
+        TEST_ASSERT_LESS_OR_EQUAL_UINT32(150000U, frame.sample_rate_hz);
+
+        recorder_sink_stats_t rstats = {0};
+        TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+        TEST_ASSERT_EQUAL_UINT32(1U, rstats.frames_pushed);
+        TEST_ASSERT_EQUAL_UINT32(frame.sample_rate_hz, rstats.last_sample_rate_hz);
+    }
+
+    tool_logic_set_isr_sample_cb_for_test(NULL, NULL);
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    (void)tool_logic_set_sample_rate(LOGIC_RATE_100KHZ);
+}
+
+TEST_CASE("given sampled mode when GPTimer stalls then capture times out cleanly without recorder push", "[tool_logic][timeout]")
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_register());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+
+    tool_logic_set_capture_source(NULL, NULL);
+    tool_logic_set_isr_sample_cb_for_test(NULL, NULL);
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_capture_mode(LOGIC_CAP_MODE_SAMPLED));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(LOGIC_RATE_100KHZ));
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(LOGIC_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    recorder_sink_test_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_set_mode(REC_MODE_USB_STUB));
+
+    tool_logic_force_gptimer_timeout_for_test(true);
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    tool_logic_force_gptimer_timeout_for_test(false);
+    ui_shell_step();
+
+    static logic_frame_t frame;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, frame.hw_error);
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)frame.total_captured);
+    TEST_ASSERT_EQUAL_UINT32(0U, frame.sample_rate_hz);
+
+    recorder_sink_stats_t rstats = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(0U, rstats.frames_pushed);
+
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+}
+
+typedef struct {
+    uint32_t sim_ts_us;
+    uint32_t half_period_us;
+    uint8_t level;
+    bool flood_same_level;
+} logic_edge_feeder_ctx_t;
+
+static void logic_edge_feeder_timer_cb(void *arg)
+{
+    logic_edge_feeder_ctx_t *ctx = (logic_edge_feeder_ctx_t *)arg;
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->flood_same_level) {
+        for (int i = 0; i < 64; ++i) {
+            ctx->sim_ts_us += 2U;
+            tool_logic_record_edge_isr_for_test(ctx->sim_ts_us, 1U);
+        }
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            ctx->level ^= 1U;
+            ctx->sim_ts_us += ctx->half_period_us;
+            tool_logic_record_edge_isr_for_test(ctx->sim_ts_us, ctx->level);
+        }
+    }
+}
+
+TEST_CASE("given RMT_EDGE mode when idle or driven by continuous edges or flooded then no_capture continuous decode and ISR cap work", "[tool_logic][rmt_edge]")
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_register());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+
+    tool_logic_set_capture_source(NULL, NULL);
+    tool_logic_set_isr_sample_cb_for_test(NULL, NULL);
+    tool_logic_force_gptimer_timeout_for_test(false);
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_edge_timeout_us(15000U));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_capture_mode(LOGIC_CAP_MODE_RMT_EDGE));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_sample_rate(LOGIC_RATE_100KHZ));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_protocol(LOGIC_PROTO_PWM));
+
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(LOGIC_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Subcase A: Idle line in RMT_EDGE mode reports distinct no_capture and skips recorder push */
+    recorder_sink_test_reset();
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_set_mode(REC_MODE_USB_STUB));
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    ui_shell_step();
+
+    static logic_frame_t frame;
+    logic_window_stats_t stats = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    tool_logic_get_last_window_stats(&stats);
+    TEST_ASSERT_EQUAL(ESP_OK, frame.hw_error);
+    TEST_ASSERT_TRUE(frame.no_capture);
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)frame.total_captured);
+    TEST_ASSERT_EQUAL_UINT32(0U, frame.sample_rate_hz);
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)frame.decoded.row_count);
+
+    recorder_sink_stats_t rstats = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(0U, rstats.frames_pushed);
+
+    /* Subcase B: Continuous 1 kHz 50% duty square wave without RMT idle gap is captured and decoded */
+    logic_edge_feeder_ctx_t feed_ctx = {
+        .sim_ts_us = 1000U,
+        .half_period_us = 500U,
+        .level = 0U,
+        .flood_same_level = false,
+    };
+    esp_timer_handle_t feed_timer = NULL;
+    const esp_timer_create_args_t targs = {
+        .callback = logic_edge_feeder_timer_cb,
+        .arg = &feed_ctx,
+        .name = "logic_edge_feed",
+    };
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_create(&targs, &feed_timer));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_edge_timeout_us(30000U));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_start_periodic(feed_timer, 1000U));
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    (void)esp_timer_stop(feed_timer);
+    ui_shell_step();
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    tool_logic_get_last_window_stats(&stats);
+    TEST_ASSERT_EQUAL(ESP_OK, frame.hw_error);
+    TEST_ASSERT_FALSE(frame.no_capture);
+    TEST_ASSERT_GREATER_THAN_UINT32(0U, (uint32_t)frame.total_captured);
+    TEST_ASSERT_EQUAL_UINT32(100000U, frame.sample_rate_hz);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(4U, frame.edge_count);
+    TEST_ASSERT_TRUE(frame.decoded.pwm.valid);
+    TEST_ASSERT_FLOAT_WITHIN(50.0f, 1000.0f, frame.decoded.pwm.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(5.0f, 50.0f, frame.decoded.pwm.duty_pct);
+
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
+    TEST_ASSERT_EQUAL_UINT32(1U, rstats.frames_pushed);
+    TEST_ASSERT_EQUAL_UINT32(100000U, rstats.last_sample_rate_hz);
+
+    /* Subcase C: Same-level edge storm hits 512-invocation hard cap and terminates early */
+    feed_ctx.sim_ts_us = 1000U;
+    feed_ctx.flood_same_level = true;
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_edge_timeout_us(200000U));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_start_periodic(feed_timer, 1000U));
+
+    int64_t flood_start_us = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(true));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_run_single_step());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_set_running(false));
+    int64_t flood_elapsed_us = esp_timer_get_time() - flood_start_us;
+    (void)esp_timer_stop(feed_timer);
+    (void)esp_timer_delete(feed_timer);
+
+    TEST_ASSERT_EQUAL(ESP_OK, tool_logic_get_latest_frame(&frame));
+    tool_logic_get_last_window_stats(&stats);
+    TEST_ASSERT_TRUE(stats.edge_isr_capped);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(LOGIC_EDGE_ISR_MAX_INVOCATIONS, stats.edge_isr_invocations);
+    TEST_ASSERT_EQUAL_UINT32(1U, stats.edge_stored_count);
+    TEST_ASSERT_TRUE(frame.no_capture);
+    TEST_ASSERT_LESS_THAN_INT32(120000, (int32_t)flood_elapsed_us);
+
+    (void)tool_logic_set_edge_timeout_us(LOGIC_EDGE_DEFAULT_TIMEOUT_US);
+    (void)tool_logic_set_capture_mode(LOGIC_CAP_MODE_SAMPLED);
+    (void)tool_logic_set_sample_rate(LOGIC_RATE_100KHZ);
+    (void)tool_logic_set_protocol(LOGIC_PROTO_UART);
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    TEST_ASSERT_TRUE(heap_caps_check_integrity_all(true));
+}
