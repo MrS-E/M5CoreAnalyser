@@ -39,9 +39,15 @@ extern "C" {
 #define LOGIC_MAX_DECODED_ITEMS         (16U)       /**< Maximum decoded protocol items per frame */
 #define LOGIC_DECODED_TEXT_MAX          (48U)       /**< Max characters per decoded packet table row */
 #define LOGIC_UART_ASCII_MAX            (33U)       /**< Max assembled ASCII string length for UART decoder */
-#define LOGIC_ISR_BOUNCE_SAMPLES        (512U)      /**< Internal SRAM bounce buffer size for GPTimer ISR */
+#define LOGIC_ISR_BOUNCE_SAMPLES        (1024U)     /**< Internal SRAM ring bounce buffer size for GPTimer ISR (power of 2) */
 #define LOGIC_RMT_BOUNCE_SYMBOLS        (128U)      /**< Internal SRAM bounce buffer symbols for RMT RX ISR */
+#define LOGIC_EDGE_BOUNCE_MAX           (256U)      /**< Max GPIO edge transitions in internal SRAM per edge window */
+#define LOGIC_EDGE_ISR_MAX_INVOCATIONS  (512U)      /**< Hard cap on GPIO edge ISR invocations per window */
 #define LOGIC_RMT_RESOLUTION_HZ         (1000000U)  /**< 1 MHz (1 us/tick) RMT RX resolution */
+#define LOGIC_SAMPLED_MAX_RATE_HZ       (100000U)   /**< Max sustainable GPTimer ISR sampling rate (100 kHz = 10 us) */
+#define LOGIC_EDGE_DEFAULT_TIMEOUT_US   (25000U)    /**< Default edge capture window timeout in microseconds (25 ms) */
+#define LOGIC_EDGE_MIN_TIMEOUT_US       (5000U)     /**< Minimum configurable edge capture timeout (5 ms) */
+#define LOGIC_EDGE_MAX_TIMEOUT_US       (500000U)   /**< Maximum configurable edge capture timeout (500 ms) */
 
 #if CONFIG_SPIRAM
 #define LOGIC_PSRAM_BUFFER_BYTES        (65536U)    /**< Full 64 KB PSRAM sample buffer on M5Stack Core2 */
@@ -74,6 +80,17 @@ typedef enum {
     LOGIC_RATE_1MHZ,
     LOGIC_RATE_COUNT
 } logic_sample_rate_t;
+
+/** Maximum sustainable periodic GPTimer ISR preset in `LOGIC_CAP_MODE_SAMPLED`. */
+#define LOGIC_SAMPLED_MAX_RATE          LOGIC_RATE_100KHZ
+
+/**
+ * @brief Single GPIO edge transition timestamp recorded in internal SRAM (`DRAM_ATTR`).
+ */
+typedef struct {
+    uint32_t timestamp_us;      /**< Timestamp in microseconds (`esp_timer_get_time()`) */
+    uint8_t level;              /**< Digital logic level (`0` or `1`) AFTER the edge transition */
+} logic_edge_sample_t;
 
 /**
  * @brief Selectable protocol decoders.
@@ -229,10 +246,17 @@ typedef struct {
  */
 typedef struct {
     uint8_t view_samples[LOGIC_VIEW_POINTS]; /**< Zoomed & panned 4-channel bitmask samples for waveform lanes */
-    size_t total_captured;                   /**< Total samples in PSRAM capture buffer */
+    size_t total_captured;                   /**< Total samples in PSRAM capture buffer (`0` when `no_capture` is true) */
     size_t trigger_index;                    /**< Detected trigger sample index */
     bool triggered;                          /**< True if edge trigger matched */
-    uint32_t sample_rate_hz;                 /**< Effective sample rate in Hz */
+    uint32_t sample_rate_hz;                 /**< Measured actual sample rate in Hz (`0` when `no_capture` is true) */
+    uint32_t requested_rate_hz;              /**< Nominal requested sample rate in Hz from preset */
+    uint32_t effective_rate_hz;              /**< Target sample rate in Hz after mode-dependent safety cap */
+    uint32_t capture_elapsed_us;             /**< Measured capture duration in microseconds */
+    uint32_t edge_count;                     /**< Observed edge transition count in the capture window */
+    bool rate_capped;                        /**< True if `requested_rate_hz` was capped to `effective_rate_hz` */
+    bool no_capture;                         /**< True when `RMT_EDGE` observed no complete pulse before timeout */
+    esp_err_t hw_error;                      /**< `ESP_OK` on normal operation, or hardware/timeout error code */
     logic_capture_mode_t cap_mode;           /**< Active capture mode (`SAMPLED` or `RMT_EDGE`) */
     logic_protocol_t protocol;               /**< Active protocol decoder */
     gpio_num_t channel_pins[LOGIC_CHANNEL_COUNT]; /**< Pin assignment for CH0..CH3 */
@@ -252,6 +276,48 @@ typedef struct {
  * @return Sample rate in Hz (`10000`..`1000000`), or `0` if invalid.
  */
 uint32_t logic_sample_rate_to_hz(logic_sample_rate_t rate);
+
+/**
+ * @brief Clamp a requested `logic_sample_rate_t` preset to the maximum sustainable rate for `mode`.
+ *
+ * In `LOGIC_CAP_MODE_SAMPLED`, presets above `LOGIC_SAMPLED_MAX_RATE` (`100 kHz`) are clamped to
+ * `LOGIC_RATE_100KHZ` because periodic GPTimer ISRs above 100 kHz (`< 10 us` period) would starve
+ * the CPU. In `LOGIC_CAP_MODE_RMT_EDGE`, all presets up to `1 MHz` are permitted.
+ *
+ * @param[in] mode Capture mode (`SAMPLED` or `RMT_EDGE`).
+ * @param[in] rate Requested sample rate preset.
+ * @return Clamped `logic_sample_rate_t`.
+ */
+logic_sample_rate_t logic_clamp_sample_rate(logic_capture_mode_t mode, logic_sample_rate_t rate);
+
+/**
+ * @brief Return the effective target sample rate in Hz for `(mode, rate)` after applying safety caps.
+ *
+ * @param[in] mode Capture mode (`SAMPLED` or `RMT_EDGE`).
+ * @param[in] rate Requested sample rate preset.
+ * @return Effective target sample rate in Hz (`10000`..`100000` for `SAMPLED`, `10000`..`1000000` for `RMT_EDGE`), or `0` if invalid.
+ */
+uint32_t logic_effective_sample_rate_hz(logic_capture_mode_t mode, logic_sample_rate_t rate);
+
+/**
+ * @brief Convert an array of GPIO edge transition timestamps (`1 us` resolution) into ESP32 RMT symbol words.
+ *
+ * Rejects duplicate-level or zero-duration glitches and packs consecutive pulse durations (`t[k+1] - t[k]`,
+ * clamped to `1..32767 us`) into `rmt_symbol_word_t` half-words so continuous edge streams without an RMT
+ * idle gap can be expanded through `logic_expand_rmt_to_samples()`.
+ *
+ * @param[in]  edges            Array of `logic_edge_sample_t` transitions.
+ * @param[in]  edge_count       Number of transitions in `edges` (at least `2` required to form 1 pulse).
+ * @param[out] out_symbols      Destination `rmt_symbol_word_t` buffer.
+ * @param[in]  max_symbols      Capacity of `out_symbols` in words.
+ * @param[out] out_symbol_count Pointer to receive number of `rmt_symbol_word_t` words written.
+ * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` on NULL/invalid pointers.
+ */
+esp_err_t logic_edge_timestamps_to_rmt_symbols(const logic_edge_sample_t *edges,
+                                               size_t edge_count,
+                                               rmt_symbol_word_t *out_symbols,
+                                               size_t max_symbols,
+                                               size_t *out_symbol_count);
 
 /**
  * @brief Return a compact display string for `rate` (e.g. `"100kHz"`, `"1MHz"`).
@@ -593,6 +659,23 @@ bool tool_logic_is_running(void);
  * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` if `out_frame` is `NULL`.
  */
 esp_err_t tool_logic_get_latest_frame(logic_frame_t *out_frame);
+
+/**
+ * @brief Set the maximum wait timeout in microseconds for `LOGIC_CAP_MODE_RMT_EDGE`.
+ *
+ * Valid range: `LOGIC_EDGE_MIN_TIMEOUT_US` (`5000 us`) .. `LOGIC_EDGE_MAX_TIMEOUT_US` (`500000 us`).
+ *
+ * @param[in] timeout_us Edge capture timeout in microseconds.
+ * @return `ESP_OK` on success, `ESP_ERR_INVALID_ARG` if out of range.
+ */
+esp_err_t tool_logic_set_edge_timeout_us(uint32_t timeout_us);
+
+/**
+ * @brief Get the configured maximum wait timeout in microseconds for `LOGIC_CAP_MODE_RMT_EDGE`.
+ *
+ * @return Edge capture timeout in microseconds.
+ */
+uint32_t tool_logic_get_edge_timeout_us(void);
 
 /**
  * @brief Return the static `analyser_tool_t` descriptor for the Logic Analyzer instrument.

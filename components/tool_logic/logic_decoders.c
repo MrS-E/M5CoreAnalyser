@@ -31,6 +31,97 @@ uint32_t logic_sample_rate_to_hz(logic_sample_rate_t rate)
     }
 }
 
+logic_sample_rate_t logic_clamp_sample_rate(logic_capture_mode_t mode, logic_sample_rate_t rate)
+{
+    if (rate < 0 || rate >= LOGIC_RATE_COUNT) {
+        return LOGIC_RATE_100KHZ;
+    }
+    if (mode == LOGIC_CAP_MODE_SAMPLED && rate > LOGIC_SAMPLED_MAX_RATE) {
+        return LOGIC_SAMPLED_MAX_RATE;
+    }
+    return rate;
+}
+
+uint32_t logic_effective_sample_rate_hz(logic_capture_mode_t mode, logic_sample_rate_t rate)
+{
+    if (mode < 0 || mode >= LOGIC_CAP_MODE_COUNT || rate < 0 || rate >= LOGIC_RATE_COUNT) {
+        return 0U;
+    }
+    logic_sample_rate_t clamped = logic_clamp_sample_rate(mode, rate);
+    return logic_sample_rate_to_hz(clamped);
+}
+
+esp_err_t logic_edge_timestamps_to_rmt_symbols(const logic_edge_sample_t *edges,
+                                               size_t edge_count,
+                                               rmt_symbol_word_t *out_symbols,
+                                               size_t max_symbols,
+                                               size_t *out_symbol_count)
+{
+    if (out_symbols == NULL || max_symbols == 0U || out_symbol_count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_symbol_count = 0U;
+    if (edges == NULL || edge_count < 2U) {
+        return ESP_OK;
+    }
+
+    bool have_anchor = false;
+    uint32_t anchor_ts = 0U;
+    uint8_t anchor_lvl = 0U;
+    size_t sym_idx = 0U;
+    bool half_filled = false;
+
+    for (size_t i = 0; i < edge_count && sym_idx < max_symbols; ++i) {
+        uint8_t lvl = edges[i].level & 1U;
+        uint32_t ts = edges[i].timestamp_us;
+
+        if (!have_anchor) {
+            anchor_ts = ts;
+            anchor_lvl = lvl;
+            have_anchor = true;
+            continue;
+        }
+        if (lvl == anchor_lvl) {
+            /* Ignore duplicate same-level bounce */
+            continue;
+        }
+        if (ts <= anchor_ts) {
+            /* Zero-duration sub-microsecond glitch: update level without emitting 0-tick pulse */
+            anchor_lvl = lvl;
+            continue;
+        }
+
+        uint32_t dt = ts - anchor_ts;
+        while (dt > 0U && sym_idx < max_symbols) {
+            uint16_t chunk = (dt > 32767U) ? 32767U : (uint16_t)dt;
+            if (!half_filled) {
+                out_symbols[sym_idx].duration0 = chunk;
+                out_symbols[sym_idx].level0 = anchor_lvl;
+                out_symbols[sym_idx].duration1 = 0U;
+                out_symbols[sym_idx].level1 = 0U;
+                half_filled = true;
+            } else {
+                out_symbols[sym_idx].duration1 = chunk;
+                out_symbols[sym_idx].level1 = anchor_lvl;
+                sym_idx++;
+                half_filled = false;
+            }
+            dt -= (uint32_t)chunk;
+        }
+
+        anchor_ts = ts;
+        anchor_lvl = lvl;
+    }
+
+    if (half_filled && sym_idx < max_symbols) {
+        sym_idx++;
+    }
+
+    *out_symbol_count = sym_idx;
+    return ESP_OK;
+}
+
 const char *logic_sample_rate_to_str(logic_sample_rate_t rate)
 {
     switch (rate) {

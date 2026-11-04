@@ -79,7 +79,19 @@ static volatile uint32_t s_capture_seq = 0;
 
 /* Internal SRAM ISR bounce buffers & state (never in PSRAM) */
 static DRAM_ATTR uint8_t s_isr_bounce_buf[LOGIC_ISR_BOUNCE_SAMPLES];
+static DRAM_ATTR volatile size_t s_isr_target_samples = LOGIC_DEFAULT_CAPTURE_SAMPLES;
 static DRAM_ATTR volatile size_t s_isr_write_idx = 0;
+static DRAM_ATTR volatile size_t s_isr_read_idx = 0;
+static DRAM_ATTR volatile uint32_t s_isr_overrun_count = 0;
+static DRAM_ATTR volatile uint32_t s_isr_alarm_count = 0;
+static DRAM_ATTR volatile uint64_t s_isr_interval_us = 10ULL;
+static DRAM_ATTR gptimer_alarm_config_t s_isr_alarm_cfg = {
+    .reload_count = 0ULL,
+    .alarm_count = 10ULL,
+    .flags.auto_reload_on_alarm = true,
+};
+static DRAM_ATTR volatile int64_t s_isr_first_sample_us = 0;
+static DRAM_ATTR volatile int64_t s_isr_last_sample_us = 0;
 static DRAM_ATTR volatile bool s_isr_capture_done = false;
 static DRAM_ATTR gpio_num_t s_isr_pins[LOGIC_CHANNEL_COUNT] = {
     BSP_PIN_PORT_C_RXD2,
@@ -87,17 +99,34 @@ static DRAM_ATTR gpio_num_t s_isr_pins[LOGIC_CHANNEL_COUNT] = {
     BSP_PIN_PORT_A_SDA,
     BSP_PIN_PORT_A_SCL,
 };
+static DRAM_ATTR logic_isr_sample_fn_t s_test_isr_sample_fn = NULL;
+static DRAM_ATTR void *s_test_isr_sample_ctx = NULL;
+static DRAM_ATTR volatile bool s_force_gptimer_timeout = false;
 
 static DRAM_ATTR rmt_symbol_word_t s_rmt_bounce_buf[LOGIC_RMT_BOUNCE_SYMBOLS];
 static DRAM_ATTR volatile size_t s_rmt_isr_symbol_count = 0;
 static DRAM_ATTR volatile bool s_rmt_isr_done = false;
 
-/* Hardware peripheral handles */
+/* Internal SRAM GPIO edge bounce buffer for continuous signals in RMT_EDGE mode */
+static DRAM_ATTR logic_edge_sample_t s_edge_bounce_buf[LOGIC_EDGE_BOUNCE_MAX];
+static DRAM_ATTR volatile size_t s_edge_bounce_count = 0;
+static DRAM_ATTR volatile uint32_t s_edge_isr_invocations = 0;
+static DRAM_ATTR volatile bool s_edge_isr_capped = false;
+static DRAM_ATTR volatile uint8_t s_edge_last_level = 0xFFU;
+static DRAM_ATTR volatile uint32_t s_edge_first_us = 0;
+static DRAM_ATTR volatile uint32_t s_edge_last_us = 0;
+static DRAM_ATTR volatile gpio_num_t s_edge_isr_pin = GPIO_NUM_NC;
+
+/* Hardware peripheral handles & diagnostics */
 static gptimer_handle_t s_gptimer = NULL;
 static bool s_gptimer_enabled = false;
 static rmt_channel_handle_t s_rmt_chan = NULL;
 static bool s_rmt_enabled = false;
 static gpio_num_t s_rmt_configured_pin = GPIO_NUM_NC;
+static gpio_num_t s_edge_registered_pin = GPIO_NUM_NC;
+static uint32_t s_edge_timeout_us = LOGIC_EDGE_DEFAULT_TIMEOUT_US;
+static logic_window_stats_t s_last_win_stats = {0};
+static volatile uint32_t s_worker_stack_hwm = 0U;
 
 /* 64 KB PSRAM capture buffer & frame double buffer */
 static uint8_t *s_psram_capture_buf = NULL;
@@ -360,6 +389,58 @@ void tool_logic_set_capture_source(logic_capture_source_fn_t fn, void *user_ctx)
     portEXIT_CRITICAL(&s_logic_lock);
 }
 
+esp_err_t tool_logic_set_edge_timeout_us(uint32_t timeout_us)
+{
+    if (timeout_us < LOGIC_EDGE_MIN_TIMEOUT_US || timeout_us > LOGIC_EDGE_MAX_TIMEOUT_US) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_logic_lock);
+    s_edge_timeout_us = timeout_us;
+    s_capture_seq++;
+    portEXIT_CRITICAL(&s_logic_lock);
+    return ESP_OK;
+}
+
+uint32_t tool_logic_get_edge_timeout_us(void)
+{
+    portENTER_CRITICAL(&s_logic_lock);
+    uint32_t t = s_edge_timeout_us;
+    portEXIT_CRITICAL(&s_logic_lock);
+    return t;
+}
+
+void tool_logic_set_isr_sample_cb_for_test(logic_isr_sample_fn_t fn, void *user_ctx)
+{
+    portENTER_CRITICAL(&s_logic_lock);
+    s_test_isr_sample_fn = fn;
+    s_test_isr_sample_ctx = user_ctx;
+    s_capture_seq++;
+    portEXIT_CRITICAL(&s_logic_lock);
+}
+
+void tool_logic_force_gptimer_timeout_for_test(bool force_timeout)
+{
+    portENTER_CRITICAL(&s_logic_lock);
+    s_force_gptimer_timeout = force_timeout;
+    s_capture_seq++;
+    portEXIT_CRITICAL(&s_logic_lock);
+}
+
+void tool_logic_get_last_window_stats(logic_window_stats_t *out_stats)
+{
+    if (out_stats == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_logic_lock);
+    *out_stats = s_last_win_stats;
+    portEXIT_CRITICAL(&s_logic_lock);
+}
+
+uint32_t tool_logic_get_worker_stack_hwm(void)
+{
+    return s_worker_stack_hwm;
+}
+
 /* --------------------------------------------------------------------------
  * Fast GPIO Register Packing & Hardware ISR Callbacks (Internal SRAM Only)
  * -------------------------------------------------------------------------- */
@@ -382,19 +463,114 @@ static bool IRAM_ATTR on_logic_gptimer_alarm_isr(gptimer_handle_t timer,
                                                  const gptimer_alarm_event_data_t *edata,
                                                  void *user_ctx)
 {
-    (void)edata;
     (void)user_ctx;
     size_t idx = s_isr_write_idx;
-    if (idx < LOGIC_ISR_BOUNCE_SAMPLES) {
-        s_isr_bounce_buf[idx] = pack_gpio_sample_fast((const gpio_num_t *)s_isr_pins);
+    size_t target = s_isr_target_samples;
+    if (idx < target) {
+        s_isr_alarm_count++;
+        int64_t now_us = esp_timer_get_time();
+        if (idx == 0U) {
+            s_isr_first_sample_us = now_us;
+        }
+        logic_isr_sample_fn_t sample_fn = s_test_isr_sample_fn;
+        uint8_t sample = (sample_fn != NULL)
+                             ? sample_fn(idx, now_us, s_test_isr_sample_ctx)
+                             : pack_gpio_sample_fast((const gpio_num_t *)s_isr_pins);
+        if ((idx - s_isr_read_idx) < LOGIC_ISR_BOUNCE_SAMPLES) {
+            s_isr_bounce_buf[idx & (LOGIC_ISR_BOUNCE_SAMPLES - 1U)] = sample;
+        } else {
+            s_isr_overrun_count++;
+        }
         idx++;
         s_isr_write_idx = idx;
-        if (idx >= LOGIC_ISR_BOUNCE_SAMPLES) {
+        if (idx >= target) {
+            s_isr_last_sample_us = now_us;
             s_isr_capture_done = true;
             (void)gptimer_stop(timer);
+        } else {
+            /* With `auto_reload_on_alarm = true`, `gptimer_default_isr` has already reloaded
+             * the counter to 0 and re-enabled the alarm at `s_isr_interval_us` with zero
+             * cumulative drift whenever `cur_cnt < s_isr_interval_us`. Only if ISR entry/host
+             * latency already exceeded `s_isr_interval_us` (where QEMU's `esp32_timg` deletes
+             * the timer on `alarm_val - value <= 0`) do we reset the counter and re-arm. */
+            uint64_t cur_cnt = 0ULL;
+            (void)gptimer_get_raw_count(timer, &cur_cnt);
+            if ((edata != NULL && edata->count_value >= s_isr_interval_us) ||
+                cur_cnt >= s_isr_interval_us) {
+                (void)gptimer_set_raw_count(timer, 0ULL);
+            }
         }
+    } else {
+        s_isr_capture_done = true;
+        (void)gptimer_stop(timer);
     }
     return false;
+}
+
+static inline void IRAM_ATTR record_logic_edge_iram(uint32_t now_us, uint8_t level)
+{
+    uint32_t inv = s_edge_isr_invocations + 1U;
+    s_edge_isr_invocations = inv;
+
+    if (s_edge_isr_capped || inv > LOGIC_EDGE_ISR_MAX_INVOCATIONS) {
+        s_edge_isr_capped = true;
+        gpio_num_t pin = s_edge_isr_pin;
+        if (pin >= 0) {
+            (void)gpio_intr_disable(pin);
+        }
+        return;
+    }
+
+    uint8_t lvl = level & 1U;
+    size_t idx = s_edge_bounce_count;
+    if (idx > 0U && lvl == s_edge_last_level) {
+        if (inv >= LOGIC_EDGE_ISR_MAX_INVOCATIONS) {
+            s_edge_isr_capped = true;
+            gpio_num_t pin = s_edge_isr_pin;
+            if (pin >= 0) {
+                (void)gpio_intr_disable(pin);
+            }
+        }
+        return;
+    }
+
+    if (idx < LOGIC_EDGE_BOUNCE_MAX) {
+        s_edge_bounce_buf[idx].timestamp_us = now_us;
+        s_edge_bounce_buf[idx].level = lvl;
+        s_edge_last_level = lvl;
+        if (idx == 0U) {
+            s_edge_first_us = now_us;
+        }
+        s_edge_last_us = now_us;
+        idx++;
+        s_edge_bounce_count = idx;
+    }
+
+    if (idx >= LOGIC_EDGE_BOUNCE_MAX || inv >= LOGIC_EDGE_ISR_MAX_INVOCATIONS) {
+        s_edge_isr_capped = true;
+        gpio_num_t pin = s_edge_isr_pin;
+        if (pin >= 0) {
+            (void)gpio_intr_disable(pin);
+        }
+    }
+}
+
+static void IRAM_ATTR on_logic_gpio_edge_isr(void *arg)
+{
+    (void)arg;
+    gpio_num_t pin = s_edge_isr_pin;
+    if (pin < 0) {
+        return;
+    }
+    uint32_t p = (uint32_t)pin;
+    uint8_t lvl = (p < 32U) ? (uint8_t)((GPIO.in >> p) & 1U)
+                            : (uint8_t)((GPIO.in1.val >> (p - 32U)) & 1U);
+    record_logic_edge_iram((uint32_t)esp_timer_get_time(), lvl);
+}
+
+void tool_logic_record_edge_isr_for_test(uint32_t timestamp_us, uint8_t level)
+{
+    record_logic_edge_iram(timestamp_us, level);
 }
 
 static bool IRAM_ATTR on_logic_rmt_done_isr(rmt_channel_handle_t channel,
@@ -417,11 +593,19 @@ static bool IRAM_ATTR on_logic_rmt_done_isr(rmt_channel_handle_t channel,
 }
 
 /* --------------------------------------------------------------------------
- * Hardware Peripheral Setup & Teardown (GPTimer + RMT RX)
+ * Hardware Peripheral Setup & Teardown (GPTimer + RMT RX + GPIO Edge ISR)
  * -------------------------------------------------------------------------- */
 
 static void teardown_logic_peripherals(void)
 {
+    if (s_edge_registered_pin != GPIO_NUM_NC) {
+        (void)gpio_intr_disable(s_edge_registered_pin);
+        (void)gpio_set_intr_type(s_edge_registered_pin, GPIO_INTR_DISABLE);
+        (void)gpio_isr_handler_remove(s_edge_registered_pin);
+        s_edge_registered_pin = GPIO_NUM_NC;
+    }
+    s_edge_isr_pin = GPIO_NUM_NC;
+
     if (s_gptimer != NULL) {
         if (s_gptimer_enabled) {
             (void)gptimer_stop(s_gptimer);
@@ -443,31 +627,52 @@ static void teardown_logic_peripherals(void)
     s_rmt_configured_pin = GPIO_NUM_NC;
 }
 
-static void ensure_logic_gptimer(void)
+static esp_err_t ensure_logic_gptimer(void)
 {
-    if (s_gptimer != NULL) {
-        return;
+    if (s_gptimer != NULL && s_gptimer_enabled) {
+        return ESP_OK;
     }
+    if (s_gptimer != NULL) {
+        (void)gptimer_del_timer(s_gptimer);
+        s_gptimer = NULL;
+    }
+
     gptimer_config_t tcfg = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 1000000U,
     };
-    if (gptimer_new_timer(&tcfg, &s_gptimer) == ESP_OK && s_gptimer != NULL) {
-        gptimer_event_callbacks_t cbs = {
-            .on_alarm = on_logic_gptimer_alarm_isr,
-        };
-        (void)gptimer_register_event_callbacks(s_gptimer, &cbs, NULL);
-        if (gptimer_enable(s_gptimer) == ESP_OK) {
-            s_gptimer_enabled = true;
-        }
+    esp_err_t err = gptimer_new_timer(&tcfg, &s_gptimer);
+    if (err != ESP_OK || s_gptimer == NULL) {
+        s_gptimer = NULL;
+        return (err != ESP_OK) ? err : ESP_FAIL;
     }
+
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = on_logic_gptimer_alarm_isr,
+    };
+    err = gptimer_register_event_callbacks(s_gptimer, &cbs, NULL);
+    if (err != ESP_OK) {
+        (void)gptimer_del_timer(s_gptimer);
+        s_gptimer = NULL;
+        return err;
+    }
+
+    err = gptimer_enable(s_gptimer);
+    if (err != ESP_OK) {
+        (void)gptimer_del_timer(s_gptimer);
+        s_gptimer = NULL;
+        return err;
+    }
+
+    s_gptimer_enabled = true;
+    return ESP_OK;
 }
 
-static void ensure_logic_rmt(gpio_num_t ch0_pin)
+static esp_err_t ensure_logic_rmt(gpio_num_t ch0_pin)
 {
-    if (s_rmt_chan != NULL && s_rmt_configured_pin == ch0_pin) {
-        return;
+    if (s_rmt_chan != NULL && s_rmt_enabled && s_rmt_configured_pin == ch0_pin) {
+        return ESP_OK;
     }
     if (s_rmt_chan != NULL) {
         if (s_rmt_enabled) {
@@ -476,6 +681,7 @@ static void ensure_logic_rmt(gpio_num_t ch0_pin)
         }
         (void)rmt_del_channel(s_rmt_chan);
         s_rmt_chan = NULL;
+        s_rmt_configured_pin = GPIO_NUM_NC;
     }
 
     rmt_rx_channel_config_t rcfg = {
@@ -484,16 +690,59 @@ static void ensure_logic_rmt(gpio_num_t ch0_pin)
         .resolution_hz = LOGIC_RMT_RESOLUTION_HZ,
         .mem_block_symbols = 64U,
     };
-    if (rmt_new_rx_channel(&rcfg, &s_rmt_chan) == ESP_OK && s_rmt_chan != NULL) {
-        rmt_rx_event_callbacks_t cbs = {
-            .on_recv_done = on_logic_rmt_done_isr,
-        };
-        (void)rmt_rx_register_event_callbacks(s_rmt_chan, &cbs, NULL);
-        if (rmt_enable(s_rmt_chan) == ESP_OK) {
-            s_rmt_enabled = true;
-        }
-        s_rmt_configured_pin = ch0_pin;
+    esp_err_t err = rmt_new_rx_channel(&rcfg, &s_rmt_chan);
+    if (err != ESP_OK || s_rmt_chan == NULL) {
+        s_rmt_chan = NULL;
+        return (err != ESP_OK) ? err : ESP_FAIL;
     }
+
+    rmt_rx_event_callbacks_t cbs = {
+        .on_recv_done = on_logic_rmt_done_isr,
+    };
+    err = rmt_rx_register_event_callbacks(s_rmt_chan, &cbs, NULL);
+    if (err != ESP_OK) {
+        (void)rmt_del_channel(s_rmt_chan);
+        s_rmt_chan = NULL;
+        return err;
+    }
+
+    err = rmt_enable(s_rmt_chan);
+    if (err != ESP_OK) {
+        (void)rmt_del_channel(s_rmt_chan);
+        s_rmt_chan = NULL;
+        return err;
+    }
+
+    s_rmt_enabled = true;
+    s_rmt_configured_pin = ch0_pin;
+    return ESP_OK;
+}
+
+static esp_err_t ensure_logic_edge_isr(gpio_num_t ch0_pin)
+{
+    esp_err_t isr_srv_err = gpio_install_isr_service(0);
+    if (isr_srv_err != ESP_OK && isr_srv_err != ESP_ERR_INVALID_STATE) {
+        return isr_srv_err;
+    }
+
+    if (s_edge_registered_pin != ch0_pin) {
+        if (s_edge_registered_pin != GPIO_NUM_NC) {
+            (void)gpio_intr_disable(s_edge_registered_pin);
+            (void)gpio_set_intr_type(s_edge_registered_pin, GPIO_INTR_DISABLE);
+            (void)gpio_isr_handler_remove(s_edge_registered_pin);
+            s_edge_registered_pin = GPIO_NUM_NC;
+        }
+        esp_err_t err = gpio_set_intr_type(ch0_pin, GPIO_INTR_ANYEDGE);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = gpio_isr_handler_add(ch0_pin, on_logic_gpio_edge_isr, NULL);
+        if (err != ESP_OK) {
+            return err;
+        }
+        s_edge_registered_pin = ch0_pin;
+    }
+    return ESP_OK;
 }
 
 static bool should_abort_capture(uint32_t start_seq, bool is_bg_worker)
@@ -505,41 +754,23 @@ static bool should_abort_capture(uint32_t start_seq, bool is_bg_worker)
     return abort;
 }
 
-static bool wait_until_us(int64_t deadline_us, uint32_t start_seq, bool is_bg_worker)
+static uint32_t count_buffer_transitions(const uint8_t *samples, size_t count)
 {
-    int64_t remaining_us = deadline_us - esp_timer_get_time();
-    while (remaining_us >= 1500) {
-        if (should_abort_capture(start_seq, is_bg_worker)) {
-            return false;
-        }
-        uint32_t delay_ms = (uint32_t)((remaining_us - 500) / 1000);
-        if (delay_ms > 5U) {
-            delay_ms = 5U;
-        }
-        TickType_t ticks = pdMS_TO_TICKS(delay_ms);
-        if (ticks == 0) {
-            ticks = 1;
-        }
-        vTaskDelay(ticks);
-        remaining_us = deadline_us - esp_timer_get_time();
+    if (samples == NULL || count < 2U) {
+        return 0U;
     }
-
-    while (remaining_us > 0) {
-        if (should_abort_capture(start_seq, is_bg_worker)) {
-            return false;
+    uint32_t edges = 0U;
+    for (size_t i = 1U; i < count; ++i) {
+        if ((samples[i] & 0x0FU) != (samples[i - 1U] & 0x0FU)) {
+            edges++;
         }
-        if (remaining_us > 50) {
-            esp_rom_delay_us(40U);
-        } else if (remaining_us > 4) {
-            esp_rom_delay_us((uint32_t)(remaining_us - 2));
-        }
-        remaining_us = deadline_us - esp_timer_get_time();
     }
-    return !should_abort_capture(start_seq, is_bg_worker);
+    return edges;
 }
 
 static esp_err_t capture_logic_buffer(logic_capture_mode_t cap_mode,
                                       const gpio_num_t pins[LOGIC_CHANNEL_COUNT],
+                                      logic_sample_rate_t rate_enum,
                                       uint32_t requested_rate_hz,
                                       uint32_t start_seq,
                                       bool is_bg_worker,
@@ -547,30 +778,57 @@ static esp_err_t capture_logic_buffer(logic_capture_mode_t cap_mode,
                                       size_t target_samples,
                                       size_t *out_captured_count,
                                       uint32_t *out_actual_rate_hz,
+                                      uint32_t *out_effective_rate_hz,
+                                      uint32_t *out_elapsed_us,
+                                      uint32_t *out_edge_count,
+                                      bool *out_rate_capped,
+                                      bool *out_no_capture,
                                       uint64_t *out_timestamp_us,
                                       bool *out_aborted)
 {
     *out_aborted = false;
     *out_captured_count = 0U;
-    *out_actual_rate_hz = requested_rate_hz;
+    *out_actual_rate_hz = 0U;
+    *out_elapsed_us = 0U;
+    *out_edge_count = 0U;
+    *out_no_capture = false;
     *out_timestamp_us = (uint64_t)esp_timer_get_time();
+
+    uint32_t effective_rate_hz = logic_effective_sample_rate_hz(cap_mode, rate_enum);
+    if (effective_rate_hz == 0U) {
+        effective_rate_hz = LOGIC_SAMPLED_MAX_RATE_HZ;
+    }
+    *out_effective_rate_hz = effective_rate_hz;
+    *out_rate_capped = (requested_rate_hz > effective_rate_hz);
 
     logic_capture_source_fn_t custom_fn = NULL;
     void *custom_ctx = NULL;
+    uint32_t edge_timeout_us = LOGIC_EDGE_DEFAULT_TIMEOUT_US;
+    bool force_timeout = false;
     portENTER_CRITICAL(&s_logic_lock);
     custom_fn = s_custom_source_fn;
     custom_ctx = s_custom_source_ctx;
+    edge_timeout_us = s_edge_timeout_us;
+    force_timeout = s_force_gptimer_timeout;
     portEXIT_CRITICAL(&s_logic_lock);
 
     if (custom_fn != NULL) {
-        return custom_fn(cap_mode,
-                         pins,
-                         requested_rate_hz,
-                         out_psram_samples,
-                         target_samples,
-                         out_captured_count,
-                         out_actual_rate_hz,
-                         custom_ctx);
+        esp_err_t cerr = custom_fn(cap_mode,
+                                   pins,
+                                   requested_rate_hz,
+                                   out_psram_samples,
+                                   target_samples,
+                                   out_captured_count,
+                                   out_actual_rate_hz,
+                                   custom_ctx);
+        if (cerr == ESP_OK) {
+            *out_edge_count = count_buffer_transitions(out_psram_samples, *out_captured_count);
+            if (cap_mode == LOGIC_CAP_MODE_RMT_EDGE && *out_captured_count == 0U) {
+                *out_no_capture = true;
+                *out_actual_rate_hz = 0U;
+            }
+        }
+        return cerr;
     }
 
     for (uint8_t c = 0U; c < LOGIC_CHANNEL_COUNT; ++c) {
@@ -578,22 +836,51 @@ static esp_err_t capture_logic_buffer(logic_capture_mode_t cap_mode,
     }
 
     if (cap_mode == LOGIC_CAP_MODE_RMT_EDGE) {
-        ensure_logic_rmt(pins[0]);
-        s_rmt_isr_symbol_count = 0U;
-        s_rmt_isr_done = false;
-
-        if (s_rmt_chan != NULL && s_rmt_enabled) {
-            rmt_receive_config_t rx_cfg = {
-                .signal_range_min_ns = 500U,
-                .signal_range_max_ns = 15000000U, /* 15 ms idle threshold */
-            };
-            (void)rmt_receive(
-                s_rmt_chan, s_rmt_bounce_buf, sizeof(s_rmt_bounce_buf), &rx_cfg);
+        esp_err_t rmt_err = ensure_logic_rmt(pins[0]);
+        if (rmt_err != ESP_OK) {
+            return rmt_err;
+        }
+        esp_err_t edge_err = ensure_logic_edge_isr(pins[0]);
+        if (edge_err != ESP_OK) {
+            return edge_err;
         }
 
-        int64_t rmt_deadline_us = esp_timer_get_time() + 18000;
-        while (!s_rmt_isr_done && esp_timer_get_time() < rmt_deadline_us) {
+        s_rmt_isr_symbol_count = 0U;
+        s_rmt_isr_done = false;
+        s_edge_bounce_count = 0U;
+        s_edge_isr_invocations = 0U;
+        s_edge_isr_capped = false;
+        s_edge_last_level = 0xFFU;
+        s_edge_first_us = 0U;
+        s_edge_last_us = 0U;
+        s_edge_isr_pin = pins[0];
+
+        int64_t edge_start_us = esp_timer_get_time();
+        *out_timestamp_us = (uint64_t)edge_start_us;
+        (void)gpio_intr_enable(pins[0]);
+
+        rmt_receive_config_t rx_cfg = {
+            .signal_range_min_ns = 500U,
+            .signal_range_max_ns = 2500000U, /* 2.5 ms idle threshold for burst frames */
+        };
+        (void)rmt_receive(s_rmt_chan, s_rmt_bounce_buf, sizeof(s_rmt_bounce_buf), &rx_cfg);
+
+        uint64_t target_span_us = ((uint64_t)target_samples * 1000000ULL) / (uint64_t)effective_rate_hz;
+        int64_t rmt_deadline_us = edge_start_us + (int64_t)edge_timeout_us;
+
+        while (esp_timer_get_time() < rmt_deadline_us) {
+            if (s_rmt_isr_done && s_rmt_isr_symbol_count > 0U) {
+                break;
+            }
+            if (s_edge_isr_capped) {
+                break;
+            }
+            size_t e_cnt = s_edge_bounce_count;
+            if (e_cnt >= 4U && (uint64_t)(s_edge_last_us - s_edge_first_us) >= target_span_us) {
+                break;
+            }
             if (should_abort_capture(start_seq, is_bg_worker)) {
+                (void)gpio_intr_disable(pins[0]);
                 if (s_rmt_chan != NULL && s_rmt_enabled) {
                     (void)rmt_disable(s_rmt_chan);
                     (void)rmt_enable(s_rmt_chan);
@@ -604,92 +891,208 @@ static esp_err_t capture_logic_buffer(logic_capture_mode_t cap_mode,
             vTaskDelay(pdMS_TO_TICKS(2));
         }
 
+        (void)gpio_intr_disable(pins[0]);
         if (s_rmt_chan != NULL && s_rmt_enabled && !s_rmt_isr_done) {
             (void)rmt_disable(s_rmt_chan);
             (void)rmt_enable(s_rmt_chan);
         }
 
+        uint32_t elapsed_us = (uint32_t)(esp_timer_get_time() - edge_start_us);
+        *out_elapsed_us = elapsed_us;
+
         size_t rmt_cnt = s_rmt_isr_symbol_count;
+        size_t edge_cnt = s_edge_bounce_count;
+        size_t sym_cnt = 0U;
+        size_t expanded = 0U;
         memset(out_psram_samples, 0, target_samples);
+
         if (rmt_cnt > 0U && s_psram_rmt_buf != NULL) {
             memcpy(s_psram_rmt_buf,
                    (const void *)s_rmt_bounce_buf,
                    rmt_cnt * sizeof(rmt_symbol_word_t));
-            size_t expanded = 0U;
+            sym_cnt = rmt_cnt;
             (void)logic_expand_rmt_to_samples(s_psram_rmt_buf,
-                                              rmt_cnt,
+                                              sym_cnt,
                                               LOGIC_RMT_RESOLUTION_HZ,
-                                              requested_rate_hz,
+                                              effective_rate_hz,
                                               0U,
                                               out_psram_samples,
                                               target_samples,
                                               &expanded);
-        } else {
-            /* Populate static pin levels when no RMT transitions arrived */
-            uint8_t idle_mask = pack_gpio_sample_fast(pins);
-            memset(out_psram_samples, idle_mask, target_samples);
+        } else if (edge_cnt >= 2U && s_psram_rmt_buf != NULL) {
+            /* Continuous signal fallback: convert DRAM edge timestamps to RMT symbols in PSRAM */
+            (void)logic_edge_timestamps_to_rmt_symbols((const logic_edge_sample_t *)s_edge_bounce_buf,
+                                                       edge_cnt,
+                                                       s_psram_rmt_buf,
+                                                       LOGIC_RMT_BOUNCE_SYMBOLS,
+                                                       &sym_cnt);
+            if (sym_cnt > 0U) {
+                (void)logic_expand_rmt_to_samples(s_psram_rmt_buf,
+                                                  sym_cnt,
+                                                  LOGIC_RMT_RESOLUTION_HZ,
+                                                  effective_rate_hz,
+                                                  0U,
+                                                  out_psram_samples,
+                                                  target_samples,
+                                                  &expanded);
+            }
         }
-        *out_captured_count = target_samples;
-        *out_actual_rate_hz = requested_rate_hz;
+
+        portENTER_CRITICAL(&s_logic_lock);
+        s_last_win_stats.gptimer_isr_count = 0U;
+        s_last_win_stats.bounce_overruns = 0U;
+        s_last_win_stats.edge_isr_invocations = s_edge_isr_invocations;
+        s_last_win_stats.edge_stored_count = (uint32_t)edge_cnt;
+        s_last_win_stats.edge_isr_capped = s_edge_isr_capped;
+        s_last_win_stats.rmt_symbol_count = (uint32_t)sym_cnt;
+        s_last_win_stats.capture_elapsed_us = elapsed_us;
+        portEXIT_CRITICAL(&s_logic_lock);
+
+        if (expanded > 0U) {
+            *out_captured_count = expanded;
+            *out_actual_rate_hz = effective_rate_hz;
+            *out_edge_count = (edge_cnt > 0U) ? (uint32_t)edge_cnt
+                                              : count_buffer_transitions(out_psram_samples, expanded);
+            *out_no_capture = false;
+        } else {
+            /* Distinct no-capture state: do NOT fabricate flat-line samples */
+            *out_captured_count = 0U;
+            *out_actual_rate_hz = 0U;
+            *out_edge_count = (uint32_t)edge_cnt;
+            *out_no_capture = true;
+        }
         return ESP_OK;
     }
 
     /* LOGIC_CAP_MODE_SAMPLED:
-     * Sample in internal SRAM bounce chunks (`s_isr_bounce_buf`) using GPTimer / deadline
-     * pacing and copy batches into the 64 KB PSRAM buffer (`out_psram_samples`). */
-    ensure_logic_gptimer();
-    uint32_t interval_us = (requested_rate_hz > 0U && requested_rate_hz <= 1000000U)
-                               ? (1000000U / requested_rate_hz)
-                               : 1U;
-    if (interval_us == 0U) {
-        interval_us = 1U;
+     * Genuine hardware GPTimer auto-reload ISR sampling into internal SRAM ring bounce buffer
+     * (`s_isr_bounce_buf`) at sustainable rates (<= 100 kHz / >= 10 us period), drained by the
+     * Core 1 worker into the 64 KB PSRAM capture buffer (`out_psram_samples`). */
+    if (s_edge_registered_pin != GPIO_NUM_NC) {
+        (void)gpio_intr_disable(s_edge_registered_pin);
     }
 
-    size_t written_total = 0U;
+    esp_err_t err = ensure_logic_gptimer();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint32_t interval_us = 1000000U / effective_rate_hz;
+    if (interval_us < (1000000U / LOGIC_SAMPLED_MAX_RATE_HZ)) {
+        interval_us = (1000000U / LOGIC_SAMPLED_MAX_RATE_HZ);
+    }
+
+    (void)gptimer_stop(s_gptimer);
+    s_isr_target_samples = target_samples;
+    s_isr_write_idx = 0U;
+    s_isr_read_idx = 0U;
+    s_isr_overrun_count = 0U;
+    s_isr_alarm_count = 0U;
+    s_isr_interval_us = (uint64_t)interval_us;
+    s_isr_alarm_cfg.reload_count = 0ULL;
+    s_isr_alarm_cfg.alarm_count = (uint64_t)interval_us;
+    s_isr_alarm_cfg.flags.auto_reload_on_alarm = true;
+    s_isr_first_sample_us = 0;
+    s_isr_last_sample_us = 0;
+    s_isr_capture_done = false;
+    for (uint8_t c = 0U; c < LOGIC_CHANNEL_COUNT; ++c) {
+        s_isr_pins[c] = pins[c];
+    }
+
+    err = gptimer_set_raw_count(s_gptimer, 0ULL);
+    if (err == ESP_OK) {
+        err = gptimer_set_alarm_action(s_gptimer, &s_isr_alarm_cfg);
+    }
     int64_t capture_start_us = esp_timer_get_time();
     *out_timestamp_us = (uint64_t)capture_start_us;
-
-    while (written_total < target_samples) {
-        size_t chunk_len = target_samples - written_total;
-        if (chunk_len > LOGIC_ISR_BOUNCE_SAMPLES) {
-            chunk_len = LOGIC_ISR_BOUNCE_SAMPLES;
-        }
-
-        for (size_t i = 0; i < chunk_len; ++i) {
-            size_t global_idx = written_total + i;
-            if ((i & 15U) == 0U && should_abort_capture(start_seq, is_bg_worker)) {
-                *out_aborted = true;
-                return ESP_ERR_INVALID_STATE;
-            }
-            if (global_idx > 0U && interval_us >= 5U) {
-                int64_t deadline = capture_start_us + (int64_t)global_idx * (int64_t)interval_us;
-                if (!wait_until_us(deadline, start_seq, is_bg_worker)) {
-                    *out_aborted = true;
-                    return ESP_ERR_INVALID_STATE;
-                }
-            }
-            s_isr_bounce_buf[i] = pack_gpio_sample_fast(pins);
-        }
-
-        /* Stage internal SRAM bounce chunk into PSRAM capture buffer */
-        memcpy(&out_psram_samples[written_total], (const void *)s_isr_bounce_buf, chunk_len);
-        written_total += chunk_len;
+    if (err == ESP_OK && !force_timeout) {
+        err = gptimer_start(s_gptimer);
+    }
+    if (err != ESP_OK) {
+        (void)gptimer_stop(s_gptimer);
+        return err;
     }
 
-    int64_t elapsed_us = esp_timer_get_time() - capture_start_us;
-    if (elapsed_us > 0 && written_total > 1U && interval_us >= 5U) {
-        uint64_t num = (uint64_t)(written_total - 1U) * 1000000ULL;
-        uint64_t measured_hz = (num + (uint64_t)elapsed_us / 2ULL) / (uint64_t)elapsed_us;
+    int64_t expected_us = (int64_t)target_samples * (int64_t)interval_us;
+    int64_t timeout_us = force_timeout ? 20000 : (expected_us * 4 + 100000);
+    int64_t deadline_us = capture_start_us + timeout_us;
+    size_t read_idx = 0U;
+
+    while (!s_isr_capture_done) {
+        size_t write_snap = s_isr_write_idx;
+        while (read_idx < write_snap && read_idx < target_samples) {
+            out_psram_samples[read_idx] =
+                s_isr_bounce_buf[read_idx & (LOGIC_ISR_BOUNCE_SAMPLES - 1U)];
+            read_idx++;
+        }
+        s_isr_read_idx = read_idx;
+
+        if (s_isr_capture_done) {
+            break;
+        }
+        if (should_abort_capture(start_seq, is_bg_worker)) {
+            (void)gptimer_stop(s_gptimer);
+            *out_aborted = true;
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (esp_timer_get_time() >= deadline_us) {
+            (void)gptimer_stop(s_gptimer);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1);
+    }
+    (void)gptimer_stop(s_gptimer);
+
+    size_t final_write = s_isr_write_idx;
+    if (final_write > target_samples) {
+        final_write = target_samples;
+    }
+    while (read_idx < final_write) {
+        out_psram_samples[read_idx] =
+            s_isr_bounce_buf[read_idx & (LOGIC_ISR_BOUNCE_SAMPLES - 1U)];
+        read_idx++;
+    }
+    s_isr_read_idx = read_idx;
+
+    int64_t span_us = s_isr_last_sample_us - s_isr_first_sample_us;
+    if (span_us <= 0) {
+        span_us = esp_timer_get_time() - capture_start_us;
+    }
+    uint32_t elapsed_u32 = (span_us > 0) ? (uint32_t)span_us : 0U;
+    *out_elapsed_us = elapsed_u32;
+
+    if (span_us > 0 && final_write > 1U) {
+        uint64_t num = (uint64_t)(final_write - 1U) * 1000000ULL;
+        uint64_t measured_hz = (num + (uint64_t)span_us / 2ULL) / (uint64_t)span_us;
         *out_actual_rate_hz = (measured_hz > UINT32_MAX) ? UINT32_MAX : (uint32_t)measured_hz;
     } else {
-        *out_actual_rate_hz = requested_rate_hz;
+        *out_actual_rate_hz = 0U;
     }
-    *out_captured_count = written_total;
+    *out_captured_count = final_write;
+    *out_edge_count = count_buffer_transitions(out_psram_samples, final_write);
+
+    portENTER_CRITICAL(&s_logic_lock);
+    s_last_win_stats.gptimer_isr_count = s_isr_alarm_count;
+    s_last_win_stats.bounce_overruns = s_isr_overrun_count;
+    s_last_win_stats.edge_isr_invocations = 0U;
+    s_last_win_stats.edge_stored_count = 0U;
+    s_last_win_stats.edge_isr_capped = false;
+    s_last_win_stats.rmt_symbol_count = 0U;
+    s_last_win_stats.capture_elapsed_us = elapsed_u32;
+    portEXIT_CRITICAL(&s_logic_lock);
+
     return ESP_OK;
 }
 
 static esp_err_t logic_worker_step_locked(bool is_bg_worker)
 {
+    if (is_bg_worker) {
+        uint32_t hwm = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+        if (s_worker_stack_hwm == 0U || hwm < s_worker_stack_hwm) {
+            s_worker_stack_hwm = hwm;
+        }
+    }
+
     if (s_psram_capture_buf == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -719,32 +1122,44 @@ static esp_err_t logic_worker_step_locked(bool is_bg_worker)
     if (req_rate_hz == 0U) {
         req_rate_hz = 100000U;
     }
+    uint32_t eff_rate_hz = logic_effective_sample_rate_hz(cap_mode, rate_enum);
+    if (eff_rate_hz == 0U) {
+        eff_rate_hz = LOGIC_SAMPLED_MAX_RATE_HZ;
+    }
 
-    size_t captured = LOGIC_DEFAULT_CAPTURE_SAMPLES;
-    uint32_t actual_rate_hz = req_rate_hz;
+    size_t captured = 0U;
+    uint32_t actual_rate_hz = 0U;
+    uint32_t elapsed_us = 0U;
+    uint32_t edge_count = 0U;
+    bool rate_capped = (req_rate_hz > eff_rate_hz);
+    bool no_capture = false;
+    esp_err_t hw_err = ESP_OK;
     uint64_t capture_ts_us = 0U;
 
     if (running) {
         bool aborted = false;
-        esp_err_t err = capture_logic_buffer(cap_mode,
-                                             pins,
-                                             req_rate_hz,
-                                             start_seq,
-                                             is_bg_worker,
-                                             s_psram_capture_buf,
-                                             LOGIC_DEFAULT_CAPTURE_SAMPLES,
-                                             &captured,
-                                             &actual_rate_hz,
-                                             &capture_ts_us,
-                                             &aborted);
+        hw_err = capture_logic_buffer(cap_mode,
+                                      pins,
+                                      rate_enum,
+                                      req_rate_hz,
+                                      start_seq,
+                                      is_bg_worker,
+                                      s_psram_capture_buf,
+                                      LOGIC_DEFAULT_CAPTURE_SAMPLES,
+                                      &captured,
+                                      &actual_rate_hz,
+                                      &eff_rate_hz,
+                                      &elapsed_us,
+                                      &edge_count,
+                                      &rate_capped,
+                                      &no_capture,
+                                      &capture_ts_us,
+                                      &aborted);
         if (aborted) {
             return ESP_OK;
         }
-        if (err != ESP_OK || captured == 0U) {
-            return err;
-        }
-
-        if (recorder_sink_is_recording()) {
+        if (hw_err == ESP_OK && !no_capture && captured > 0U && actual_rate_hz > 0U &&
+            recorder_sink_is_recording()) {
             recorder_frame_t rec_frame = {
                 .tool_id = LOGIC_TOOL_ID,
                 .sample_rate_hz = actual_rate_hz,
@@ -757,10 +1172,14 @@ static esp_err_t logic_worker_step_locked(bool is_bg_worker)
         }
     } else {
         portENTER_CRITICAL(&s_logic_lock);
-        if (s_latest_frame.total_captured > 0U) {
-            captured = s_latest_frame.total_captured;
-            actual_rate_hz = s_latest_frame.sample_rate_hz;
-        }
+        captured = s_latest_frame.total_captured;
+        actual_rate_hz = s_latest_frame.sample_rate_hz;
+        eff_rate_hz = s_latest_frame.effective_rate_hz;
+        elapsed_us = s_latest_frame.capture_elapsed_us;
+        edge_count = s_latest_frame.edge_count;
+        rate_capped = s_latest_frame.rate_capped;
+        no_capture = s_latest_frame.no_capture;
+        hw_err = s_latest_frame.hw_error;
         portEXIT_CRITICAL(&s_logic_lock);
     }
 
@@ -772,20 +1191,18 @@ static esp_err_t logic_worker_step_locked(bool is_bg_worker)
     pan_off = s_pan_offset;
     portEXIT_CRITICAL(&s_logic_lock);
 
-    bool triggered = false;
-    size_t trig_idx = 0U;
-    (void)logic_find_digital_trigger(
-        s_psram_capture_buf, captured, 0U, trig_mode, &triggered, &trig_idx);
-
     logic_frame_t *wptr = (logic_frame_t *)psram_double_buf_get_write_ptr(&s_frame_dbuf);
     if (wptr != NULL) {
         memset(wptr, 0, sizeof(*wptr));
-        (void)logic_extract_viewport(
-            s_psram_capture_buf, captured, zoom, pan_off, wptr->view_samples, LOGIC_VIEW_POINTS);
         wptr->total_captured = captured;
-        wptr->trigger_index = trig_idx;
-        wptr->triggered = triggered;
         wptr->sample_rate_hz = actual_rate_hz;
+        wptr->requested_rate_hz = req_rate_hz;
+        wptr->effective_rate_hz = eff_rate_hz;
+        wptr->capture_elapsed_us = elapsed_us;
+        wptr->edge_count = edge_count;
+        wptr->rate_capped = rate_capped;
+        wptr->no_capture = no_capture;
+        wptr->hw_error = hw_err;
         wptr->cap_mode = cap_mode;
         wptr->protocol = proto;
         for (uint8_t c = 0U; c < LOGIC_CHANNEL_COUNT; ++c) {
@@ -793,9 +1210,31 @@ static esp_err_t logic_worker_step_locked(bool is_bg_worker)
         }
         wptr->zoom = zoom;
         wptr->pan_offset = pan_off;
+        wptr->decoded.protocol = proto;
 
-        (void)logic_decode_run_protocol(
-            s_psram_capture_buf, captured, actual_rate_hz, proto, uart_baud, &wptr->decoded);
+        if (hw_err != ESP_OK) {
+            (void)snprintf(wptr->decoded.summary,
+                           sizeof(wptr->decoded.summary),
+                           "HW Error: %s",
+                           esp_err_to_name(hw_err));
+        } else if (no_capture || captured == 0U) {
+            wptr->no_capture = true;
+            (void)snprintf(wptr->decoded.summary,
+                           sizeof(wptr->decoded.summary),
+                           "RMT EDGE: No transitions captured");
+        } else {
+            bool triggered = false;
+            size_t trig_idx = 0U;
+            (void)logic_find_digital_trigger(
+                s_psram_capture_buf, captured, 0U, trig_mode, &triggered, &trig_idx);
+            wptr->trigger_index = trig_idx;
+            wptr->triggered = triggered;
+
+            (void)logic_extract_viewport(
+                s_psram_capture_buf, captured, zoom, pan_off, wptr->view_samples, LOGIC_VIEW_POINTS);
+            (void)logic_decode_run_protocol(
+                s_psram_capture_buf, captured, actual_rate_hz, proto, uart_baud, &wptr->decoded);
+        }
 
         portENTER_CRITICAL(&s_logic_lock);
         s_latest_frame = *wptr;
@@ -804,7 +1243,7 @@ static esp_err_t logic_worker_step_locked(bool is_bg_worker)
         (void)psram_double_buf_swap(&s_frame_dbuf);
     }
 
-    return ESP_OK;
+    return hw_err;
 }
 
 static esp_err_t logic_worker_step(void *ctx)
@@ -904,7 +1343,11 @@ static void on_modal_mode_clicked(lv_event_t *e)
 static void on_modal_rate_clicked(lv_event_t *e)
 {
     (void)e;
-    logic_sample_rate_t next = (logic_sample_rate_t)((tool_logic_get_sample_rate() + 1) % LOGIC_RATE_COUNT);
+    logic_capture_mode_t mode = tool_logic_get_capture_mode();
+    uint32_t max_rates = (mode == LOGIC_CAP_MODE_SAMPLED)
+                             ? ((uint32_t)LOGIC_SAMPLED_MAX_RATE + 1U)
+                             : (uint32_t)LOGIC_RATE_COUNT;
+    logic_sample_rate_t next = (logic_sample_rate_t)(((uint32_t)tool_logic_get_sample_rate() + 1U) % max_rates);
     (void)tool_logic_set_sample_rate(next);
 }
 
@@ -1203,12 +1646,47 @@ static void logic_on_ui_refresh(void *ctx)
     uint16_t pan_off = tool_logic_get_pan_offset();
 
     if (s_lbl_top_status != NULL) {
-        lv_label_set_text_fmt(s_lbl_top_status,
-                              "%s %s %s%s",
-                              (cap_mode == LOGIC_CAP_MODE_RMT_EDGE) ? "RMT" : "SAMP",
-                              logic_sample_rate_to_str(rate_enum),
-                              logic_protocol_to_str(proto),
-                              running ? "" : " [HOLD]");
+        const char *mode_str = (cap_mode == LOGIC_CAP_MODE_RMT_EDGE) ? "RMT" : "SAMP";
+        const char *hold_str = running ? "" : " [HOLD]";
+        if (s_ui_frame.hw_error != ESP_OK) {
+            lv_label_set_text_fmt(s_lbl_top_status,
+                                  "%s %s %s [HW ERR]%s",
+                                  mode_str,
+                                  logic_sample_rate_to_str(rate_enum),
+                                  logic_protocol_to_str(proto),
+                                  hold_str);
+        } else if (s_ui_frame.no_capture) {
+            lv_label_set_text_fmt(s_lbl_top_status,
+                                  "%s %s %s [NO CAP]%s",
+                                  mode_str,
+                                  logic_sample_rate_to_str(rate_enum),
+                                  logic_protocol_to_str(proto),
+                                  hold_str);
+        } else if (s_ui_frame.rate_capped) {
+            unsigned long act_khz = (unsigned long)((s_ui_frame.sample_rate_hz + 500U) / 1000U);
+            lv_label_set_text_fmt(s_lbl_top_status,
+                                  "%s %luk[CAP] %s%s",
+                                  mode_str,
+                                  act_khz,
+                                  logic_protocol_to_str(proto),
+                                  hold_str);
+        } else if (s_ui_frame.sample_rate_hz > 0U && cap_mode == LOGIC_CAP_MODE_SAMPLED) {
+            unsigned long act_khz = (unsigned long)((s_ui_frame.sample_rate_hz + 500U) / 1000U);
+            lv_label_set_text_fmt(s_lbl_top_status,
+                                  "%s %s(%luk) %s%s",
+                                  mode_str,
+                                  logic_sample_rate_to_str(rate_enum),
+                                  act_khz,
+                                  logic_protocol_to_str(proto),
+                                  hold_str);
+        } else {
+            lv_label_set_text_fmt(s_lbl_top_status,
+                                  "%s %s %s%s",
+                                  mode_str,
+                                  logic_sample_rate_to_str(rate_enum),
+                                  logic_protocol_to_str(proto),
+                                  hold_str);
+        }
     }
 
     if (s_lbl_zoom_badge != NULL) {
@@ -1229,17 +1707,32 @@ static void logic_on_ui_refresh(void *ctx)
     }
 
     if (s_chart != NULL) {
+        bool hide_waveform = (s_ui_frame.hw_error != ESP_OK) ||
+                             s_ui_frame.no_capture ||
+                             (s_ui_frame.total_captured == 0U);
+        uint32_t zf = logic_zoom_factor(zoom);
         for (uint8_t c = 0U; c < LOGIC_CHANNEL_COUNT; ++c) {
             if (s_ser_ch[c] == NULL) {
                 continue;
             }
             int32_t *pts = lv_chart_get_y_array(s_chart, s_ser_ch[c]);
             if (pts != NULL) {
-                int32_t base_y = (int32_t)c * 100 + 15;
-                int32_t high_y = base_y + 65;
-                uint8_t mask = (uint8_t)(1U << c);
-                for (size_t i = 0; i < LOGIC_VIEW_POINTS; ++i) {
-                    pts[i] = ((s_ui_frame.view_samples[i] & mask) != 0U) ? high_y : base_y;
+                if (hide_waveform) {
+                    for (size_t i = 0; i < LOGIC_VIEW_POINTS; ++i) {
+                        pts[i] = LV_CHART_POINT_NONE;
+                    }
+                } else {
+                    int32_t base_y = (int32_t)c * 100 + 15;
+                    int32_t high_y = base_y + 65;
+                    uint8_t mask = (uint8_t)(1U << c);
+                    for (size_t i = 0; i < LOGIC_VIEW_POINTS; ++i) {
+                        size_t src_idx = (size_t)pan_off + (i / (size_t)zf);
+                        if (src_idx >= s_ui_frame.total_captured) {
+                            pts[i] = LV_CHART_POINT_NONE;
+                        } else {
+                            pts[i] = ((s_ui_frame.view_samples[i] & mask) != 0U) ? high_y : base_y;
+                        }
+                    }
                 }
             }
         }
@@ -1251,7 +1744,11 @@ static void logic_on_ui_refresh(void *ctx)
     }
 
     if (s_lbl_decode_rows != NULL) {
-        if (s_ui_frame.decoded.row_count == 0U) {
+        if (s_ui_frame.hw_error != ESP_OK) {
+            lv_label_set_text(s_lbl_decode_rows, "Capture aborted due to hardware/timer error");
+        } else if (s_ui_frame.no_capture) {
+            lv_label_set_text(s_lbl_decode_rows, "No edge transitions captured (idle line)");
+        } else if (s_ui_frame.decoded.row_count == 0U) {
             lv_label_set_text(s_lbl_decode_rows, "No decoded frames in buffer");
         } else {
             char table_buf[220];
@@ -1287,7 +1784,11 @@ static void logic_on_ui_refresh(void *ctx)
                           (cap_mode == LOGIC_CAP_MODE_RMT_EDGE) ? "RMT EDGE" : "SAMPLED");
     }
     if (s_modal_rate_lbl != NULL) {
-        lv_label_set_text(s_modal_rate_lbl, logic_sample_rate_to_str(rate_enum));
+        if (cap_mode == LOGIC_CAP_MODE_SAMPLED && rate_enum > LOGIC_SAMPLED_MAX_RATE) {
+            lv_label_set_text(s_modal_rate_lbl, "100k(CAP)");
+        } else {
+            lv_label_set_text(s_modal_rate_lbl, logic_sample_rate_to_str(rate_enum));
+        }
     }
     if (s_modal_baud_lbl != NULL) {
         lv_label_set_text_fmt(s_modal_baud_lbl, "%lubd", (unsigned long)baud);
