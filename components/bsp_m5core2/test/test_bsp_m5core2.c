@@ -640,6 +640,52 @@ TEST_CASE("given axp192 reg 0x94 gpio state and battery adc registers when calcu
     TEST_ASSERT_EQUAL_UINT8(50, bsp_axp192_calc_battery_percent(3675));
 }
 
+TEST_CASE("given axp2101 core2 v1.1 chip id 0x4a when speaker backlight led and battery accessed then axp2101 registers are used", "[bsp_m5core2][axp2101]")
+{
+    memset(&s_mock_axp, 0, sizeof(s_mock_axp));
+    s_mock_axp.regs[0x03] = 0x4AU; /* AXP2101 chip ID */
+    s_mock_axp.regs[0x90] = 0x3BU; /* ALDO1/2/4, BLDO1/2 enabled */
+    /* 14-bit battery voltage: 3920 mV = 0x0F50 -> reg 0x34 = 0x0F, reg 0x35 = 0x50 */
+    s_mock_axp.regs[0x34] = 0x0FU;
+    s_mock_axp.regs[0x35] = 0x50U;
+    s_mock_axp.regs[0x01] = 0x20U; /* Charging status: bits[6:5] = 0b01 */
+
+    bsp_axp192_set_reg_ops(&s_mock_axp_ops);
+
+    uint16_t vbat_mv = 0;
+    uint8_t pct = 0;
+    bool chg = false;
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_get_battery(&vbat_mv, &pct, &chg));
+    TEST_ASSERT_EQUAL_UINT16(3920, vbat_mv);
+    TEST_ASSERT_EQUAL_UINT8(bsp_axp192_calc_battery_percent(3920), pct);
+    TEST_ASSERT_TRUE(chg);
+
+    /* Speaker enable toggles ALDO3 (bit 2 of 0x90) and sets ALDO3 voltage (0x94 = 0x1C) without disturbing BLDO2 (bit 5) */
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_speaker_enable(true));
+    TEST_ASSERT_EQUAL_HEX8(0x1CU, s_mock_axp.regs[0x94]);
+    TEST_ASSERT_BITS_HIGH(0x04U, s_mock_axp.regs[0x90]);
+    TEST_ASSERT_BITS_HIGH(0x20U, s_mock_axp.regs[0x90]);
+
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_speaker_enable(false));
+    TEST_ASSERT_BITS_LOW(0x04U, s_mock_axp.regs[0x90]);
+    TEST_ASSERT_BITS_HIGH(0x20U, s_mock_axp.regs[0x90]);
+
+    /* Backlight updates BLDO1 (0x96 and bit 4 of 0x90) */
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_lcd_backlight(0));
+    TEST_ASSERT_BITS_LOW(0x10U, s_mock_axp.regs[0x90]);
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_lcd_backlight(100));
+    TEST_ASSERT_BITS_HIGH(0x10U, s_mock_axp.regs[0x90]);
+    TEST_ASSERT_EQUAL_HEX8(28U, s_mock_axp.regs[0x96]);
+
+    /* LED updates CHGLED (0x69) */
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_led(false));
+    TEST_ASSERT_EQUAL_HEX8(0x05U, s_mock_axp.regs[0x69]);
+    TEST_ASSERT_EQUAL(ESP_OK, bsp_axp192_set_led(true));
+    TEST_ASSERT_EQUAL_HEX8(0x35U, s_mock_axp.regs[0x69]);
+
+    bsp_axp192_set_reg_ops(NULL);
+}
+
 TEST_CASE("given adc1 read args when validated then invalid pins and null output are rejected without touching hardware", "[bsp_m5core2][adc]")
 {
     int raw = -1;
