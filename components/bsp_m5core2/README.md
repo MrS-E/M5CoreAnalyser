@@ -9,8 +9,8 @@
 
 | Subsystem | ESP32 Peripheral | Pins / I²C Address | Notes |
 | :--- | :--- | :--- | :--- |
-| **Internal I²C Bus** | `I2C_NUM_0` (400 kHz) | `GPIO21` (`SDA`), `GPIO22` (`SCL`) | Shared by AXP192, FT6336U, BM8563, MPU6886 |
-| **PMIC** | `AXP192` | I²C `0x34` | Controls `DCDC1` (MCU), `DCDC3` (Backlight), `LDO2` (LCD/SD), `GPIO2` (`SPK_EN`), `GPIO4` (`TFT_RST`) |
+| **Internal I²C Bus** | `I2C_NUM_0` (400 kHz) | `GPIO21` (`SDA`), `GPIO22` (`SCL`) | Shared by AXP192 / AXP2101, FT6336U, BM8563, MPU6886 |
+| **PMIC** | `AXP192` (v1.0) / `AXP2101` (v1.1) | I²C `0x34` (`0x03`=`0x03` or `0x4A`) | Auto-detects Core2 v1.0 (`AXP192`) and Core2 v1.1 (`AXP2101`) rails, backlight, `SPK_EN`, `TFT_RST`, and battery ADC |
 | **LCD Display** | `SPI2_HOST` (`ILI9342C`) | `GPIO23` (`MOSI`), `GPIO38` (`MISO`), `GPIO18` (`SCLK`), `GPIO5` (`CS`), `GPIO15` (`DC`) | 320×240 RGB565 @ 40 MHz SPI; `GPIO4` (`SD_CS`) pulled high |
 | **Capacitive Touch** | `FT6336U` (`I2C_NUM_0`) | I²C `0x38`, `GPIO39` (`INT`) | 320×240 screen area + bottom touch circles (`y = 240..280`) |
 | **Speaker Output** | `I2S_NUM_1` (`NS4168`) | `GPIO12` (`BCK`), `GPIO0` (`WS`), `GPIO2` (`DOUT`) | 16-bit mono Philips I²S + AXP192 `SPK_EN` power gate |
@@ -21,11 +21,10 @@
 
 ## Internal Pipeline
 
-### 1. AXP192 PMIC Initialization (`bsp_axp192.c`)
-- Keeps `DCDC1` at `3.35 V` for the ESP32 core (never disabled).
-- Enables `LDO2` at `3.30 V` for the ILI9342C LCD logic and `DCDC3` at `2.80 V` for the LCD backlight.
-- Configures `AXP192 GPIO0` as a `3.3 V` LDO for the M5-Bus rail, `GPIO1` (`0x94` bit 1 `0x02`, active-low) for the green power LED, `GPIO2` (`0x94` bit 2 `0x04` `SPK_EN`, active-high) gated **OFF** by default to prevent idle speaker hiss, and `GPIO4` (`0x95`/`0x96` bit 1 `TFT_RST`) to hardware-reset the display and touch panel.
-- Enables the 12-bit battery voltage ADC (`0x78`/`0x79`, `1.1 mV/LSB`) and charge status reporting.
+### 1. AXP192 / AXP2101 PMIC Initialization (`bsp_axp192.c`)
+- Auto-detects the PMIC chip ID at register `0x03` on `I2C0` (`0x34`):
+  - **M5Stack Core2 v1.0 (`AXP192`, `chip_id = 0x03`)**: Keeps `DCDC1` at `3.35 V` for the ESP32 core, enables `LDO2` at `3.30 V` for LCD/SD logic and `DCDC3` at `2.80 V` for the LCD backlight, leaves `GPIO0` floating (`0x07`) and `EXTEN` off so USB `VBUS` is never disconnected or back-fed, configures `GPIO1` (`0x94` bit 1, active-low) for the power LED, `GPIO2` (`0x94` bit 2 `SPK_EN`, active-high) gated **OFF** by default, `GPIO4` (`TFT_RST`) for LCD/touch reset, and 12-bit battery ADC (`0x78`/`0x79`, `1.1 mV/LSB`).
+  - **M5Stack Core2 v1.1 (`AXP2101`, `chip_id = 0x4A`)**: Disables DCDC1–5 UVP power-off latch (`0x23`), configures `DCDC1`/`DCDC3` at `3.30 V`, `ALDO2` (`3.30 V` LCD/touch reset), `ALDO3` (`3.30 V` `SPK_EN`, gated **OFF** by default in `0x90` bit 2), `ALDO4` (`3.30 V` LCD/TP/TF logic), `BLDO1` (`2.80 V` LCD backlight), `CHGLED` (`0x69`), and 14-bit battery voltage ADC (`0x34`/`0x35`, `1 mV/LSB`) while preserving `BLDO2` so USB `VBUS` is never disturbed.
 
 ### 2. GPIO Reservation & Conflict Manager (`bsp_pin_manager.c`)
 - Protects all internal bus pins (`GPIO21`/`GPIO22` I²C0, `GPIO18`/`GPIO23`/`GPIO38`/`GPIO5`/`GPIO15`/`GPIO4` SPI2, `GPIO12`/`GPIO0`/`GPIO2` I²S1, `GPIO6`–`GPIO11`/`GPIO16`/`GPIO17` Flash/PSRAM, `GPIO1`/`GPIO3` UART0, `GPIO34` PDM Mic, `GPIO39` Touch IRQ) by returning `ESP_ERR_NOT_ALLOWED`.

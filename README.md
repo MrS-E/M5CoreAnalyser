@@ -1,6 +1,6 @@
 # M5CoreAnalyser — Multi-Instrument Electronic Analyzer Firmware for M5Stack Core2
 
-**M5CoreAnalyser** is a modular, dual-core ESP-IDF v6.1 multi-instrument electronic analyzer firmware for the **M5Stack Core2** (**ESP32-D0WDQ6-V3 @ 240 MHz**, **16 MB Flash**, **8 MB Quad-SPI PSRAM**, **320×240 ILI9342C** IPS TFT display, **FT6336U** capacitive touchscreen, **AXP192** PMIC, and **NS4168** `I2S1` speaker amplifier).
+**M5CoreAnalyser** is a modular, dual-core ESP-IDF v6.1 multi-instrument electronic analyzer firmware for the **M5Stack Core2** (**ESP32-D0WDQ6-V3 @ 240 MHz**, **16 MB Flash**, **8 MB Quad-SPI PSRAM**, **320×240 ILI9342C** IPS TFT display, **FT6336U** capacitive touchscreen, **AXP192 / AXP2101** PMIC, and **NS4168** `I2S1` speaker amplifier).
 
 It provides an **LVGL 9 touch-friendly UI** to launch and operate **six electrical instruments** implemented as independent ESP-IDF components, **software Analog-to-Speaker audio passthrough**, **background generator concurrency** for single-board loopback testing, and **recording UI controls + backend hooks (`recorder_sink`)** prepared for USB and Bluetooth streaming.
 
@@ -12,7 +12,7 @@ Every subsystem and instrument lives in its own component under `components/<mod
 
 | # | Component | Tool ID / Role | Key Peripherals & Capabilities | Documentation & Tests |
 | :-: | :--- | :--- | :--- | :--- |
-| 1 | [`components/bsp_m5core2`](components/bsp_m5core2/README.md) | Board Support Package | AXP192 PMIC (`I2C0` `0x34`), ILI9342C LCD (`SPI2`), FT6336U touch (`0x38`), shared calibrated `ADC1` (`GPIO36`/`GPIO35`), GPIO pin reservation (`bsp_pin_claim_ex`), and software DC-blocking `I2S1` speaker passthrough (`bsp_spk_passthrough`). | [`README.md`](components/bsp_m5core2/README.md) · [`test_bsp_m5core2.c`](components/bsp_m5core2/test/test_bsp_m5core2.c) |
+| 1 | [`components/bsp_m5core2`](components/bsp_m5core2/README.md) | Board Support Package | AXP192 (Core2 v1.0) & AXP2101 (Core2 v1.1) PMIC (`I2C0` `0x34`), ILI9342C LCD (`SPI2`), FT6336U touch (`0x38`), shared calibrated `ADC1` (`GPIO36`/`GPIO35`), GPIO pin reservation (`bsp_pin_claim_ex`), and software DC-blocking `I2S1` speaker passthrough (`bsp_spk_passthrough`). | [`README.md`](components/bsp_m5core2/README.md) · [`test_bsp_m5core2.c`](components/bsp_m5core2/test/test_bsp_m5core2.c) |
 | 2 | [`components/tool_core`](components/tool_core/README.md) | Plugin Registry & PSRAM Pipeline | `analyser_tool_t` lifecycle manager, foreground/background generator concurrency, Core 1 `tool_worker_t` helper, and tear-free 3-slot PSRAM buffer (`psram_double_buf_t`). | [`README.md`](components/tool_core/README.md) · [`test_tool_core.c`](components/tool_core/test/test_tool_core.c) |
 | 3 | [`components/recorder_sink`](components/recorder_sink/README.md) | Capture Stream Sink | Thread-safe recording state machine (`REC_MODE_OFF`, `REC_MODE_USB_STUB`, `REC_MODE_BT_STUB`) and frame/sample/byte accounting (`recorder_sink_push`). | [`README.md`](components/recorder_sink/README.md) · [`test_recorder_sink.c`](components/recorder_sink/test/test_recorder_sink.c) |
 | 4 | [`components/ui_shell`](components/ui_shell/README.md) | LVGL 9 Application Shell | Core 0 LVGL manager with persistent `320×28` status bar (`HOME`, Title, `BG GEN` pill, `SPK` toggle, `REC` mode badge, `VBAT %`) and `2×3` instrument launcher grid. | [`README.md`](components/ui_shell/README.md) · [`test_ui_shell.c`](components/ui_shell/test/test_ui_shell.c) |
@@ -71,8 +71,8 @@ idf.py build
 # Or incremental ninja build:
 ninja -C build
 
-# Flash and monitor on physical M5Stack Core2 hardware:
-idf.py -p /dev/ttyUSB0 flash monitor
+# Flash and monitor on physical M5Stack Core2 hardware (e.g. /dev/ttyACM0 or /dev/ttyUSB0):
+idf.py -p /dev/ttyACM0 flash monitor
 ```
 
 Production configuration highlights (`sdkconfig.defaults`):
@@ -81,11 +81,11 @@ Production configuration highlights (`sdkconfig.defaults`):
 - SPI Flash: **`16 MB` @ `80 MHz`** (`CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y`)
 - FreeRTOS Tick Rate: **`1000 Hz`** (`CONFIG_FREERTOS_HZ=1000`)
 
-### 3.3 Build & Run the Full Unity Test Suite in ESP32 QEMU (`test_app/`)
-All 10 component Unity test suites (**63 on-target test cases**) are compiled into `test_app/` and executed inside `qemu-system-xtensa -machine esp32` via the watchdog-protected runner script:
+### 3.3 Build & Run the Full Unity Test Suite (`test_app/` on Physical M5Core2 & ESP32 QEMU)
+All 10 component Unity test suites (**64 on-target test cases**) are compiled into `test_app/` and verified both on physical **M5Stack Core2** hardware (`/dev/ttyACM0`) and inside `qemu-system-xtensa -machine esp32` via the watchdog-protected runner script:
 
 ```bash
-# Build test_app incrementally, merge flash image, and run all 63 Unity tests in QEMU:
+# Build test_app incrementally, merge flash image, and run all 64 Unity tests in QEMU:
 ./test_app/run_qemu_tests.sh --timeout 60 --test-timeout 20
 
 # Re-run QEMU without rebuilding when test_app/build is already up to date:
