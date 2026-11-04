@@ -2,8 +2,8 @@
 
 ## 1. Purpose
 `tool_logic` implements the **4-Channel Digital Logic Analyzer & Protocol Decoder Suite** (`id = "logic"`, category `TOOL_CATEGORY_DIGITAL_IN`) for **M5CoreAnalyser** on the M5Stack Core2. It supports two selectable hardware capture engines:
-1. **Sampled Logic Mode (`LOGIC_CAP_MODE_SAMPLED`)**: Periodic multi-channel GPIO sampling (`10 kHz` to `1 MHz`) reading ESP32 `GPIO.in` (`GPIO0..31`) and `GPIO.in1.val` (`GPIO32..39`) registers via an internal SRAM bounce buffer into a `64 KB` PSRAM capture buffer (`LOGIC_PSRAM_BUFFER_BYTES = 65536` when `CONFIG_SPIRAM=y`).
-2. **Edge-Timestamp Mode (`LOGIC_CAP_MODE_RMT_EDGE`)**: Hardware pulse duration capture via ESP32 **RMT RX** at `1 MHz` (`1 µs` resolution) into an internal SRAM bounce buffer, staged into PSRAM and expanded into uniform multi-channel sample buffers via `logic_expand_rmt_to_samples()`.
+1. **Sampled Logic Mode (`LOGIC_CAP_MODE_SAMPLED`)**: Hardware **GPTimer** auto-reload ISR (`1 MHz` resolution, `on_logic_gptimer_alarm_isr`) periodically sampling `GPIO.in` (`GPIO0..31`) and `GPIO.in1.val` (`GPIO32..39`) into a `1024`-sample internal SRAM ring bounce buffer (`s_isr_bounce_buf`), drained by the Core 1 worker into a `64 KB` PSRAM capture buffer (`LOGIC_PSRAM_BUFFER_BYTES = 65536` when `CONFIG_SPIRAM=y`). Presets above `100 kHz` (`LOGIC_SAMPLED_MAX_RATE_HZ`, `10 µs` period) are clamped to `100 kHz` (`frame.rate_capped = true`), and the actual achieved sample rate (`frame.sample_rate_hz`) is computed from ISR-stamped first/last sample timestamps (`frame.capture_elapsed_us`).
+2. **Edge-Timestamp Mode (`LOGIC_CAP_MODE_RMT_EDGE`)**: Combines ESP32 **RMT RX** (`1 MHz` / `1 µs` resolution, `2.5 ms` idle threshold for burst frames) with an `IRAM_ATTR` **GPIO Edge ISR** (`on_logic_gpio_edge_isr` / `record_logic_edge_iram`) in internal SRAM (`256` transitions max, hard-capped at `512` ISR entries). Continuous signals without an RMT idle gap are converted from edge timestamps to RMT symbols via `logic_edge_timestamps_to_rmt_symbols()` and expanded in PSRAM (`10 kHz`–`1 MHz`). Idle lines with zero captured pulses report `frame.no_capture = true` (`total_captured = 0`, `sample_rate_hz = 0`) without fabricating flat-line samples or pushing empty frames to `recorder_sink`.
 
 ---
 
@@ -37,15 +37,23 @@ All 4 channel pins are claimed atomically on `on_start()` via `bsp_pin_claim(pin
 
 ## 4. Internal Pipeline, PSRAM ISR Safety & LVGL 9 UI
 
-- **Internal SRAM Bounce Buffers (`DRAM_ATTR`)**:
-  - `on_logic_gptimer_alarm_isr` and `on_logic_rmt_done_isr` (`IRAM_ATTR`) write exclusively to `s_isr_bounce_buf` and `s_rmt_bounce_buf` in internal SRAM, and the Core 1 worker task (`logic_c1`) copies batches into the `64 KB` PSRAM capture buffer (`s_psram_capture_buf`).
+- **Sampled Mode GPTimer Auto-Reload ISR & Rate Cap (`LOGIC_CAP_MODE_SAMPLED`)**:
+  - `s_gptimer` runs at `1 MHz` with `auto_reload_on_alarm = true` (`DRAM_ATTR` `s_isr_alarm_cfg`). On each alarm, `on_logic_gptimer_alarm_isr` (`IRAM_ATTR`) packs `CH0..CH3` from `GPIO.in` / `GPIO.in1.val` into `DRAM_ATTR` `s_isr_bounce_buf[1024]`, stamps `s_isr_first_sample_us` / `s_isr_last_sample_us`, and stops the timer at `target_samples` (`1024`). If ISR entry latency exceeds the alarm period (`cur_cnt >= s_isr_interval_us`), ISR-safe `gptimer_set_raw_count(timer, 0ULL)` re-arms the counter so capture never stalls in QEMU or under heavy interrupt load.
+  - Because periodic software ISRs faster than `10 µs` would starve FreeRTOS and LVGL, `logic_clamp_sample_rate()` clamps `250 kHz`, `500 kHz`, and `1 MHz` presets to `100 kHz` in `LOGIC_CAP_MODE_SAMPLED`, setting `frame.rate_capped = true` and showing `100k[CAP]` in the UI.
+  - `frame.sample_rate_hz` is computed from `(final_write - 1) * 1e6 / (s_isr_last_sample_us - s_isr_first_sample_us)`. If the timer stalls past its deadline, `capture_logic_buffer()` returns `ESP_ERR_TIMEOUT`, sets `frame.hw_error = ESP_ERR_TIMEOUT`, skips `recorder_sink_push()`, and displays `[HW ERR]` in the UI.
+- **RMT Edge Mode, Continuous Fallback, Hard ISR Cap & `no_capture` (`LOGIC_CAP_MODE_RMT_EDGE`)**:
+  - Arms both `rmt_receive()` (`2.5 ms` idle threshold) and `on_logic_gpio_edge_isr` on `CH0` for up to `s_edge_timeout_us` (default `25 ms`, configurable `5 ms..500 ms` via `tool_logic_set_edge_timeout_us()`).
+  - `record_logic_edge_iram()` increments `s_edge_isr_invocations` on *every* ISR entry (including rejected duplicate-level bounces) and disables the GPIO interrupt immediately at `512` invocations (`LOGIC_EDGE_ISR_MAX_INVOCATIONS`) or `256` stored edges (`LOGIC_EDGE_BOUNCE_MAX`).
+  - If RMT RX completes, its symbols are staged to PSRAM (`s_psram_rmt_buf`) and expanded via `logic_expand_rmt_to_samples()`. If a continuous signal prevents RMT RX idle completion, `logic_edge_timestamps_to_rmt_symbols()` converts the `DRAM_ATTR` edge timestamps into RMT symbols in PSRAM and expands them.
+  - If no complete pulse is captured (`expanded == 0`), `frame.no_capture = true`, `frame.total_captured = 0`, `frame.sample_rate_hz = 0`, `recorder_sink_push()` is skipped, all 4 chart series are cleared to `LV_CHART_POINT_NONE`, and the UI displays `[NO CAP]`.
 - **LVGL 9 Multi-Lane Waveform & Modal UI**:
   - Renders 4 non-overlapping digital waveform lanes (`CH3`..`CH0`) across a 120-point viewport with horizontal **Zoom** (`1x`, `2x`, `4x`, `8x`) and **Pan** (`<`, `>`), a decoded packet table, and a floating **Capture & Pin Mapping Modal** (`PINS` button).
 - **Recorder Sink Integration**:
-  - Exports captured packed sample buffers (`1 byte/sample`) with measured `sample_rate_hz` and `timestamp_us` to `recorder_sink_push()`.
+  - Exports valid captured packed sample buffers (`1 byte/sample`) with the actual measured `sample_rate_hz` and `timestamp_us` to `recorder_sink_push()` (skipped when `no_capture` or `hw_error != ESP_OK`).
 
 ---
 
 ## 5. Limitations
-- Requires at least $3\times$ oversampling (`sample_rate_hz >= 3 * baud_rate`) for reliable UART 8N1 center-bit decoding.
+- **Sampled Mode Ceiling**: Periodic multi-pin GPTimer ISR sampling is capped at `100 kHz` (`10 µs` sample period). Therefore, in `LOGIC_CAP_MODE_SAMPLED`, UART decoding is reliable up to `19200`–`38400` baud ($\ge 2.6\times$–$5.2\times$ oversampling at `100 kHz`); `57600` and `115200` baud UART signals on `CH0` require `LOGIC_CAP_MODE_RMT_EDGE` expanded at `500 kHz` or `1 MHz` (or a high-rate custom/DMA capture source).
+- **RMT Edge Mode Channel Count**: `LOGIC_CAP_MODE_RMT_EDGE` captures edge timing on `CH0` (`1 µs` resolution); multi-wire synchronous buses (`I²C` `SDA`+`SCL`, `SPI` `CS`+`SCK`+`MOSI`+`MISO`) must use `LOGIC_CAP_MODE_SAMPLED` at bus clock rates $\le 25\text{–}40\text{ kHz}$ (`\ge 2.5\times` oversampling at `100 kHz`).
 - All inputs operate at standard ESP32 `0–3.3 V` digital logic levels.
