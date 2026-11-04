@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "tool_analoggen.c"
+        "analoggen_lut.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        bsp_m5core2
+        tool_core
+        recorder_sink
+        lvgl
+        esp_driver_dac
+        esp_driver_gpio
+        esp_timer
+        heap
+        freertos
+        log
+)
