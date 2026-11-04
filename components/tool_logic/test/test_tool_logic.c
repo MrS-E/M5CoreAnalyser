@@ -406,6 +406,14 @@ TEST_CASE("given sample rate presets and edge timestamps when clamped and conver
     TEST_ASSERT_EQUAL_UINT32(100000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_500KHZ));
     TEST_ASSERT_EQUAL_UINT32(100000U, logic_effective_sample_rate_hz(LOGIC_CAP_MODE_SAMPLED, LOGIC_RATE_1MHZ));
 
+    TEST_ASSERT_TRUE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_SAMPLED, 0U));
+    TEST_ASSERT_TRUE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_SAMPLED, 3U));
+    TEST_ASSERT_TRUE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_RMT_EDGE, 0U));
+    TEST_ASSERT_FALSE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_RMT_EDGE, 1U));
+    TEST_ASSERT_FALSE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_RMT_EDGE, 3U));
+    TEST_ASSERT_FALSE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_COUNT, 0U));
+    TEST_ASSERT_FALSE(logic_capture_mode_channel_available(LOGIC_CAP_MODE_SAMPLED, LOGIC_CHANNEL_COUNT));
+
     /* 2. RMT_EDGE mode allows all presets up to 1 MHz */
     TEST_ASSERT_EQUAL(LOGIC_RATE_250KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_RMT_EDGE, LOGIC_RATE_250KHZ));
     TEST_ASSERT_EQUAL(LOGIC_RATE_500KHZ, logic_clamp_sample_rate(LOGIC_CAP_MODE_RMT_EDGE, LOGIC_RATE_500KHZ));
@@ -723,6 +731,7 @@ TEST_CASE("given RMT_EDGE mode when idle or driven by continuous edges or floode
     TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)frame.total_captured);
     TEST_ASSERT_EQUAL_UINT32(0U, frame.sample_rate_hz);
     TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)frame.decoded.row_count);
+    TEST_ASSERT_EQUAL_STRING("RMT EDGE: No transitions captured", frame.decoded.summary);
 
     recorder_sink_stats_t rstats = {0};
     TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_get_stats(&rstats));
