@@ -34,6 +34,9 @@ static const char *TAG = "bsp_axp192";
 
 #define AXP192_REG_POWER_STATUS     (0x00)
 #define AXP192_REG_CHARGE_STATUS    (0x01)
+#define AXP_REG_CHIP_ID             (0x03)
+#define AXP192_CHIP_ID              (0x03)
+#define AXP2101_CHIP_ID             (0x4A)
 #define AXP192_REG_OUTPUT_CTRL      (0x12)
 #define AXP192_REG_DCDC1_VOLTAGE    (0x26)
 #define AXP192_REG_DCDC3_VOLTAGE    (0x27)
@@ -41,6 +44,7 @@ static const char *TAG = "bsp_axp192";
 #define AXP192_REG_VBUS_IPSOUT      (0x30)
 #define AXP192_REG_POWER_OFF_VOLT   (0x31)
 #define AXP192_REG_CHARGE_CTRL1     (0x33)
+#define AXP192_REG_RTC_BAT_CHG      (0x35)
 #define AXP192_REG_PEK_PARAMS       (0x36)
 #define AXP192_REG_VBAT_ADC_HI      (0x78)
 #define AXP192_REG_VBAT_ADC_LO      (0x79)
@@ -53,6 +57,28 @@ static const char *TAG = "bsp_axp192";
 #define AXP192_REG_GPIO34_CTRL      (0x95)
 #define AXP192_REG_GPIO34_STATE     (0x96)
 
+/* AXP2101 registers (M5Stack Core2 v1.1 @ 0x34, chip ID 0x4A) */
+#define AXP2101_REG_PMU_COMMON      (0x10)
+#define AXP2101_REG_BATFET_CTRL     (0x12)
+#define AXP2101_REG_DCDC_UVP_CTRL   (0x23)
+#define AXP2101_REG_PWROFF_THLD     (0x27)
+#define AXP2101_REG_ADC_EN          (0x30)
+#define AXP2101_REG_VBAT_HI         (0x34)
+#define AXP2101_REG_VBAT_LO         (0x35)
+#define AXP2101_REG_TS_PIN_CTRL     (0x50)
+#define AXP2101_REG_CHG_VOLT_CTRL   (0x64)
+#define AXP2101_REG_BAT_DET_CTRL    (0x68)
+#define AXP2101_REG_CHGLED_CTRL     (0x69)
+#define AXP2101_REG_DCDC_ONOFF      (0x80)
+#define AXP2101_REG_DCDC1_VOLT      (0x82)
+#define AXP2101_REG_DCDC3_VOLT      (0x84)
+#define AXP2101_REG_LDO_ONOFF0      (0x90)
+#define AXP2101_REG_ALDO2_VOLT      (0x93)
+#define AXP2101_REG_ALDO3_VOLT      (0x94)
+#define AXP2101_REG_ALDO4_VOLT      (0x95)
+#define AXP2101_REG_BLDO1_VOLT      (0x96)
+#define AXP2101_REG_DLDO1_VOLT      (0x99)
+
 #define AXP192_I2C_TIMEOUT_MS       (50)
 
 static StaticSemaphore_t s_axp_mutex_buf;
@@ -61,6 +87,7 @@ static volatile int s_axp_mutex_state = 0; /* 0 = uninitialized, 1 = creating, 2
 
 static i2c_master_dev_handle_t s_axp_dev = NULL;
 static const bsp_axp192_reg_ops_t *s_axp_reg_ops = NULL;
+static bool s_is_axp2101 = false;
 static bool s_speaker_enabled = false;
 static bool s_led_on = true;
 static uint8_t s_reg94_shadow = 0x00U;
@@ -101,6 +128,13 @@ void bsp_axp192_set_reg_ops(const bsp_axp192_reg_ops_t *ops)
 {
     axp_lock();
     s_axp_reg_ops = ops;
+    s_is_axp2101 = false;
+    if (ops != NULL && ops->read_reg != NULL) {
+        uint8_t chip_id = 0U;
+        if (ops->read_reg(AXP_REG_CHIP_ID, &chip_id) == ESP_OK && chip_id == AXP2101_CHIP_ID) {
+            s_is_axp2101 = true;
+        }
+    }
     axp_unlock();
 }
 
@@ -176,12 +210,14 @@ static esp_err_t axp192_lcd_reset_locked(void)
     if (s_axp_dev == NULL && s_axp_reg_ops == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t err = axp192_update_bits_locked(AXP192_REG_GPIO34_STATE, (1U << 1), 0U);
+    /* AXP2101 uses ALDO2 (reg 0x90 bit 1) for LCD+Touch reset; AXP192 uses GPIO4 (reg 0x96 bit 1) */
+    const uint8_t rst_reg = s_is_axp2101 ? AXP2101_REG_LDO_ONOFF0 : AXP192_REG_GPIO34_STATE;
+    esp_err_t err = axp192_update_bits_locked(rst_reg, (1U << 1), 0U);
     if (err != ESP_OK) {
         return err;
     }
     vTaskDelay(pdMS_TO_TICKS(20));
-    err = axp192_update_bits_locked(AXP192_REG_GPIO34_STATE, (1U << 1), (1U << 1));
+    err = axp192_update_bits_locked(rst_reg, (1U << 1), (1U << 1));
     vTaskDelay(pdMS_TO_TICKS(50));
     return err;
 }
@@ -229,22 +265,76 @@ esp_err_t bsp_axp192_init(i2c_master_bus_handle_t bus_handle)
         }
     }
 
-    /* Probe AXP192 presence on internal I2C0 */
+    /* Probe PMIC presence on internal I2C0 (0x34 is shared by AXP192 on Core2 v1.0 and AXP2101 on Core2 v1.1) */
     esp_err_t err = i2c_master_probe(bus_handle, BSP_AXP192_I2C_ADDR, AXP192_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "AXP192 PMIC (0x34) not responding on I2C0: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "PMIC (0x34) not responding on I2C0: %s", esp_err_to_name(err));
         (void)i2c_master_bus_rm_device(s_axp_dev);
         s_axp_dev = NULL;
         axp_unlock();
         return err;
     }
 
-    /* 1. VBUS-IPSOUT path: enable 500 mA VBUS current limit (0x02) matching M5Core2 reference */
-    (void)axp192_update_bits_locked(AXP192_REG_VBUS_IPSOUT, 0x07, 0x02);
+    uint8_t chip_id = 0U;
+    err = axp192_read_reg_locked(AXP_REG_CHIP_ID, &chip_id);
+    if (err != ESP_OK || (chip_id != AXP192_CHIP_ID && chip_id != AXP2101_CHIP_ID)) {
+        ESP_LOGW(TAG, "Unrecognized PMIC at 0x34 (err=%s, chip_id=0x%02X); skipping PMIC register init",
+                 esp_err_to_name(err), (unsigned)chip_id);
+        axp_unlock();
+        return (err != ESP_OK) ? err : ESP_ERR_NOT_SUPPORTED;
+    }
+    s_is_axp2101 = (chip_id == AXP2101_CHIP_ID);
+    s_speaker_enabled = false;
+    s_led_on = true;
+    s_reg94_shadow = bsp_axp192_calc_gpio_state(s_reg94_shadow, s_speaker_enabled, s_led_on);
 
-    /* 2. Configure GPIO0 as LDO output at 3.3V (M5-Bus peripheral power) */
-    (void)axp192_write_reg_locked(AXP192_REG_GPIO0_MODE, 0x02);
-    (void)axp192_write_reg_locked(AXP192_REG_GPIO0_LDO_VOLT, 0xF0);
+    if (s_is_axp2101) {
+        /*
+         * M5Stack Core2 v1.1 (AXP2101 @ 0x34, chip_id = 0x4A):
+         * - Disable DCDC1-5 UVP power-off latch (reg 0x23 bits 0..4) so USB inrush dips do not power off PMIC
+         * - DCDC1 = 3.3V (ESP32), DCDC3 = 3.3V
+         * - ALDO2 = 3.3V (LCD+Touch RST), ALDO3 = 3.3V (SPK_EN, gated OFF), ALDO4 = 3.3V (LCD/TP/TF logic)
+         * - BLDO1 = 2.8V (LCD backlight); preserve ALDO1 (bit0) and BLDO2 (bit5) untouched
+         * - DLDO1 = 0.5V / OFF (vibration motor off)
+         */
+        (void)axp192_update_bits_locked(AXP2101_REG_DCDC_UVP_CTRL, 0x1FU, 0x00U);
+        (void)axp192_write_reg_locked(AXP2101_REG_DCDC1_VOLT, 0x12U); /* 3.3V */
+        (void)axp192_write_reg_locked(AXP2101_REG_DCDC3_VOLT, 0x6AU); /* 3.3V */
+        (void)axp192_update_bits_locked(AXP2101_REG_DCDC_ONOFF, 0x05U, 0x05U);
+
+        (void)axp192_write_reg_locked(AXP2101_REG_ALDO2_VOLT, 0x1CU); /* 3.3V LCD+TP RST */
+        (void)axp192_write_reg_locked(AXP2101_REG_ALDO3_VOLT, 0x1CU); /* 3.3V SPK_EN */
+        (void)axp192_write_reg_locked(AXP2101_REG_ALDO4_VOLT, 0x1CU); /* 3.3V TF/TP/LCD */
+        (void)axp192_write_reg_locked(AXP2101_REG_BLDO1_VOLT, 0x17U); /* 2.8V LCD BL */
+        (void)axp192_write_reg_locked(AXP2101_REG_DLDO1_VOLT, 0x00U); /* Vib motor off */
+
+        /* Enable ALDO2 (0x02), ALDO4 (0x08), BLDO1 (0x10); clear ALDO3 (0x04) & DLDO1 (0x80); preserve ALDO1/BLDO2 */
+        (void)axp192_update_bits_locked(AXP2101_REG_LDO_ONOFF0, 0x9EU, 0x1AU);
+
+        (void)axp192_write_reg_locked(AXP2101_REG_PWROFF_THLD, 0x00U);
+        (void)axp192_write_reg_locked(AXP2101_REG_PMU_COMMON, 0x30U);
+        (void)axp192_write_reg_locked(AXP2101_REG_BAT_DET_CTRL, 0x01U);
+        (void)axp192_write_reg_locked(AXP2101_REG_CHGLED_CTRL, 0x35U); /* LED ON */
+        (void)axp192_write_reg_locked(AXP2101_REG_ADC_EN, 0x0FU);
+        (void)axp192_write_reg_locked(AXP2101_REG_CHG_VOLT_CTRL, 0x03U); /* 4.2V */
+        (void)axp192_update_bits_locked(AXP2101_REG_TS_PIN_CTRL, 0x10U, 0x10U);
+
+        (void)axp192_lcd_reset_locked();
+        axp_unlock();
+
+        ESP_LOGI(TAG, "AXP2101 PMIC (Core2 v1.1, id=0x%02X) initialized (DCDC1=3.3V, ALDO4=3.3V, BLDO1=2.8V, SPK_EN=OFF)",
+                 (unsigned)chip_id);
+        return ESP_OK;
+    }
+
+    /*
+     * M5Stack Core2 v1.0 (AXP192 @ 0x34, chip_id = 0x03):
+     * 1. VBUS-IPSOUT path: 500 mA VBUS current limit (0x02)
+     * 2. Keep GPIO0 floating (0x07) so N_VBUSEN stays pulled low and USB VBUS is never cut off or back-fed
+     */
+    (void)axp192_update_bits_locked(AXP192_REG_VBUS_IPSOUT, 0x07, 0x02);
+    (void)axp192_write_reg_locked(AXP192_REG_GPIO0_MODE, 0x07);
+    (void)axp192_write_reg_locked(AXP192_REG_GPIO0_LDO_VOLT, 0xA0);
 
     /* 3. Set DCDC1 (ESP32 3.35V -> 0x6A) and LDO2 (LCD/SD 3.3V -> upper nibble 0xF0, LDO3 Vib 0V) */
     (void)axp192_write_reg_locked(AXP192_REG_DCDC1_VOLTAGE, 0x6A);
@@ -253,15 +343,13 @@ esp_err_t bsp_axp192_init(i2c_master_bus_handle_t bus_handle)
     /* 4. Set DCDC3 (LCD Backlight ~2.8V -> 0x54) */
     (void)axp192_write_reg_locked(AXP192_REG_DCDC3_VOLTAGE, 0x54);
 
-    /* 5. Enable DCDC1 (bit0), DCDC3 (bit1), LDO2 (bit2), EXTEN (bit6); keep LDO3 (bit3) & DCDC2 (bit4) off */
-    (void)axp192_update_bits_locked(AXP192_REG_OUTPUT_CTRL, 0x5F, 0x47);
+    /* 5. Enable DCDC1 (bit0), DCDC3 (bit1), LDO2 (bit2); keep LDO3 (bit3) & DCDC2 (bit4) off, leave EXTEN untouched */
+    (void)axp192_update_bits_locked(AXP192_REG_OUTPUT_CTRL, 0x1F, 0x07);
 
     /* 6. Configure GPIO1 (Power LED, NMOS open-drain) and GPIO2 (Speaker SPK_EN, NMOS open-drain) */
     (void)axp192_write_reg_locked(AXP192_REG_GPIO1_MODE, 0x00);
     (void)axp192_write_reg_locked(AXP192_REG_GPIO2_MODE, 0x00);
     /* Turn green power LED ON (bit1 = 0, active-low) and gate Speaker SPK_EN OFF (bit2 = 0) by default */
-    s_speaker_enabled = false;
-    s_led_on = true;
     uint8_t reg94 = 0U;
     if (axp192_read_reg_locked(AXP192_REG_GPIO012_STATE, &reg94) != ESP_OK) {
         reg94 = s_reg94_shadow;
@@ -269,17 +357,19 @@ esp_err_t bsp_axp192_init(i2c_master_bus_handle_t bus_handle)
     s_reg94_shadow = bsp_axp192_calc_gpio_state(reg94, s_speaker_enabled, s_led_on);
     (void)axp192_write_reg_locked(AXP192_REG_GPIO012_STATE, s_reg94_shadow);
 
-    /* 7. Enable battery and VBUS ADCs */
+    /* 7. Enable RTC backup charge, battery and VBUS ADCs */
+    (void)axp192_update_bits_locked(AXP192_REG_RTC_BAT_CHG, 0xE3, 0xA2);
     (void)axp192_write_reg_locked(AXP192_REG_ADC_EN1, 0xFF);
     (void)axp192_write_reg_locked(AXP192_REG_CHARGE_CTRL1, 0xC0);
 
     /* 8. Configure GPIO4 as NMOS open-drain output for LCD reset (TFT_RST) and pulse reset */
-    (void)axp192_write_reg_locked(AXP192_REG_GPIO34_CTRL, 0x84);
+    (void)axp192_update_bits_locked(AXP192_REG_GPIO34_CTRL, 0x8D, 0x84);
     (void)axp192_lcd_reset_locked();
 
     axp_unlock();
 
-    ESP_LOGI(TAG, "AXP192 PMIC initialized (DCDC1=3.35V, LDO2=3.3V, DCDC3=2.8V, SPK_EN=OFF)");
+    ESP_LOGI(TAG, "AXP192 PMIC (id=0x%02X) initialized (DCDC1=3.35V, LDO2=3.3V, DCDC3=2.8V, SPK_EN=OFF)",
+             (unsigned)chip_id);
     return ESP_OK;
 }
 
@@ -288,14 +378,27 @@ esp_err_t bsp_axp192_get_battery(uint16_t *out_voltage_mv, uint8_t *out_percent,
     uint8_t hi = 0;
     uint8_t lo = 0;
     uint8_t chg = 0;
+    bool is_2101 = false;
 
     axp_lock();
-    esp_err_t err = axp192_read_reg_locked(AXP192_REG_VBAT_ADC_HI, &hi);
-    if (err == ESP_OK) {
-        err = axp192_read_reg_locked(AXP192_REG_VBAT_ADC_LO, &lo);
-    }
-    if (err == ESP_OK) {
-        err = axp192_read_reg_locked(AXP192_REG_CHARGE_STATUS, &chg);
+    is_2101 = s_is_axp2101;
+    esp_err_t err;
+    if (is_2101) {
+        err = axp192_read_reg_locked(AXP2101_REG_VBAT_HI, &hi);
+        if (err == ESP_OK) {
+            err = axp192_read_reg_locked(AXP2101_REG_VBAT_LO, &lo);
+        }
+        if (err == ESP_OK) {
+            err = axp192_read_reg_locked(AXP192_REG_CHARGE_STATUS, &chg);
+        }
+    } else {
+        err = axp192_read_reg_locked(AXP192_REG_VBAT_ADC_HI, &hi);
+        if (err == ESP_OK) {
+            err = axp192_read_reg_locked(AXP192_REG_VBAT_ADC_LO, &lo);
+        }
+        if (err == ESP_OK) {
+            err = axp192_read_reg_locked(AXP192_REG_CHARGE_STATUS, &chg);
+        }
     }
     axp_unlock();
 
@@ -313,7 +416,18 @@ esp_err_t bsp_axp192_get_battery(uint16_t *out_voltage_mv, uint8_t *out_percent,
         return err;
     }
 
-    uint16_t vbat_mv = bsp_axp192_raw12_to_mv(hi, lo);
+    uint16_t vbat_mv;
+    bool charging;
+    if (is_2101) {
+        uint16_t raw14 = (uint16_t)(((uint16_t)(hi & 0x3FU) << 8) | lo);
+        /* Open 14-bit ADC channel on AXP2101 reads near full-scale (0x3FFF) when battery is absent */
+        vbat_mv = (raw14 >= 0x3FDFU) ? 0U : raw14;
+        charging = ((chg & 0x60U) == 0x20U);
+    } else {
+        vbat_mv = bsp_axp192_raw12_to_mv(hi, lo);
+        charging = ((chg & (1U << 6)) != 0U);
+    }
+
     if (out_voltage_mv != NULL) {
         *out_voltage_mv = vbat_mv;
     }
@@ -321,7 +435,7 @@ esp_err_t bsp_axp192_get_battery(uint16_t *out_voltage_mv, uint8_t *out_percent,
         *out_percent = bsp_axp192_calc_battery_percent(vbat_mv);
     }
     if (out_charging != NULL) {
-        *out_charging = ((chg & (1U << 6)) != 0U);
+        *out_charging = charging;
     }
     return ESP_OK;
 }
@@ -336,15 +450,28 @@ esp_err_t bsp_axp192_set_speaker_enable(bool enable)
         return ESP_OK;
     }
 
-    /* AXP192 Reg 0x94 Bit 2 (0x04) controls GPIO2 (SPK_EN on M5Stack Core2) */
-    uint8_t reg94 = 0U;
-    esp_err_t err = axp192_read_reg_locked(AXP192_REG_GPIO012_STATE, &reg94);
-    if (err == ESP_OK) {
-        uint8_t next_reg94 = bsp_axp192_calc_gpio_state(reg94, enable, s_led_on);
-        err = axp192_write_reg_locked(AXP192_REG_GPIO012_STATE, next_reg94);
+    esp_err_t err;
+    if (s_is_axp2101) {
+        /* AXP2101 (Core2 v1.1): ALDO3 (reg 0x90 bit 2 = 0x04) drives NS4168 SPK_EN at 3.3V */
+        if (enable) {
+            (void)axp192_write_reg_locked(AXP2101_REG_ALDO3_VOLT, 0x1CU);
+        }
+        err = axp192_update_bits_locked(AXP2101_REG_LDO_ONOFF0, (1U << 2), enable ? (1U << 2) : 0U);
         if (err == ESP_OK) {
             s_speaker_enabled = enable;
-            s_reg94_shadow = next_reg94;
+            s_reg94_shadow = bsp_axp192_calc_gpio_state(s_reg94_shadow, enable, s_led_on);
+        }
+    } else {
+        /* AXP192 Reg 0x94 Bit 2 (0x04) controls GPIO2 (SPK_EN on M5Stack Core2 v1.0) */
+        uint8_t reg94 = 0U;
+        err = axp192_read_reg_locked(AXP192_REG_GPIO012_STATE, &reg94);
+        if (err == ESP_OK) {
+            uint8_t next_reg94 = bsp_axp192_calc_gpio_state(reg94, enable, s_led_on);
+            err = axp192_write_reg_locked(AXP192_REG_GPIO012_STATE, next_reg94);
+            if (err == ESP_OK) {
+                s_speaker_enabled = enable;
+                s_reg94_shadow = next_reg94;
+            }
         }
     }
     axp_unlock();
@@ -371,6 +498,23 @@ esp_err_t bsp_axp192_set_lcd_backlight(uint8_t brightness_percent)
     if (s_axp_dev == NULL && s_axp_reg_ops == NULL) {
         axp_unlock();
         return ESP_OK;
+    }
+
+    if (s_is_axp2101) {
+        /* AXP2101 (Core2 v1.1): BLDO1 (reg 0x96, 100mV/step from 500mV, enable bit 4 in reg 0x90) */
+        if (brightness_percent == 0U) {
+            esp_err_t err = axp192_update_bits_locked(AXP2101_REG_LDO_ONOFF0, (1U << 4), 0U);
+            axp_unlock();
+            return err;
+        }
+        uint32_t mv = 2500U + ((uint32_t)brightness_percent * 800U) / 100U;
+        uint8_t reg_val = (uint8_t)((mv - 500U) / 100U);
+        esp_err_t err = axp192_write_reg_locked(AXP2101_REG_BLDO1_VOLT, reg_val);
+        if (err == ESP_OK) {
+            err = axp192_update_bits_locked(AXP2101_REG_LDO_ONOFF0, (1U << 4), (1U << 4));
+        }
+        axp_unlock();
+        return err;
     }
 
     if (brightness_percent == 0U) {
@@ -400,15 +544,24 @@ esp_err_t bsp_axp192_set_led(bool on)
         return ESP_OK;
     }
 
-    /* AXP192 Reg 0x94 Bit 1 (0x02) controls GPIO1 (active-low open-drain sink for green LED) */
-    uint8_t reg94 = 0U;
-    esp_err_t err = axp192_read_reg_locked(AXP192_REG_GPIO012_STATE, &reg94);
-    if (err == ESP_OK) {
-        uint8_t next_reg94 = bsp_axp192_calc_gpio_state(reg94, s_speaker_enabled, on);
-        err = axp192_write_reg_locked(AXP192_REG_GPIO012_STATE, next_reg94);
+    esp_err_t err;
+    if (s_is_axp2101) {
+        err = axp192_write_reg_locked(AXP2101_REG_CHGLED_CTRL, on ? 0x35U : 0x05U);
         if (err == ESP_OK) {
             s_led_on = on;
-            s_reg94_shadow = next_reg94;
+            s_reg94_shadow = bsp_axp192_calc_gpio_state(s_reg94_shadow, s_speaker_enabled, on);
+        }
+    } else {
+        /* AXP192 Reg 0x94 Bit 1 (0x02) controls GPIO1 (active-low open-drain sink for green LED) */
+        uint8_t reg94 = 0U;
+        err = axp192_read_reg_locked(AXP192_REG_GPIO012_STATE, &reg94);
+        if (err == ESP_OK) {
+            uint8_t next_reg94 = bsp_axp192_calc_gpio_state(reg94, s_speaker_enabled, on);
+            err = axp192_write_reg_locked(AXP192_REG_GPIO012_STATE, next_reg94);
+            if (err == ESP_OK) {
+                s_led_on = on;
+                s_reg94_shadow = next_reg94;
+            }
         }
     }
     axp_unlock();
