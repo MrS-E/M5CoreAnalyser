@@ -386,6 +386,8 @@ TEST_CASE("given real hardware capture path without source injection when contin
     TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_pin(BSP_PIN_PORT_C_TXD2));
     TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_mode(FREQ_MODE_PERIOD_RMT));
     TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_gate_window(FREQ_GATE_20MS));
+    /* Keep the no-signal edge wait short here (default is 2 s) */
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_edge_acq_max_us(100000U));
     TEST_ASSERT_EQUAL(ESP_OK, tool_freq_register());
     TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
 
@@ -468,13 +470,385 @@ TEST_CASE("given real hardware capture path without source injection when contin
 
     (void)tool_freq_set_pin(BSP_PIN_ANALOG_IN_DEFAULT);
     (void)tool_freq_set_gate_window(FREQ_GATE_100MS);
+    (void)tool_freq_set_edge_acq_max_us(FREQ_EDGE_ACQ_DEFAULT_MAX_US);
 }
 
-TEST_CASE("given cross-check scenario when period and gate frequencies differ significantly then duty is invalidated", "[tool_freq][cross_check]")
+TEST_CASE("given gate counts of varying size when cross-check tolerance and verdict are evaluated then tolerance scales with 1/N and low counts are inconclusive", "[tool_freq][cross_check]")
 {
-    freq_period_result_t pres = {.valid = true, .freq_hz = 100.0f};
-    freq_gate_result_t gres = {.valid = true, .freq_hz = 105.0f, .pulse_count = 100ULL};
-    float adjusted_freq = 0.0f;
-    TEST_ASSERT_TRUE(freq_calc_cross_check(pres.freq_hz, gres.freq_hz, gres.pulse_count, &adjusted_freq));
-    TEST_ASSERT_FLOAT_WITHIN(1.0f, 105.0f, adjusted_freq);
+    /* tolerance = max(5%, 3/N) */
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 1.0f, freq_calc_cross_check_tolerance(0ULL));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.05f, freq_calc_cross_check_tolerance(1000ULL));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.05f, freq_calc_cross_check_tolerance(60ULL));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.15f, freq_calc_cross_check_tolerance(20ULL));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.30f, freq_calc_cross_check_tolerance(10ULL));
+
+    freq_period_result_t p = {.valid = true, .freq_hz = 100.0f};
+    freq_gate_result_t g = {.valid = true, .freq_hz = 100.0f, .pulse_count = 200ULL};
+    float rel = -1.0f;
+
+    /* Equal -> OK with zero difference */
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_OK, freq_calc_cross_check(&p, &g, &rel));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.0f, rel);
+
+    /* N=200: 3.8% is inside 5%, 9.1% is outside */
+    g.freq_hz = 104.0f;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_OK, freq_calc_cross_check(&p, &g, &rel));
+    g.freq_hz = 110.0f;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_MISMATCH, freq_calc_cross_check(&p, &g, &rel));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0909f, rel);
+
+    /* N=10: +-1 count is +-10%, so 100 vs 120 Hz (16.7%) is a correct reading, 100 vs 150 (33%) is not */
+    g.pulse_count = 10ULL;
+    g.freq_hz = 120.0f;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_OK, freq_calc_cross_check(&p, &g, &rel));
+    g.freq_hz = 150.0f;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_MISMATCH, freq_calc_cross_check(&p, &g, &rel));
+
+    /* N below the statistical minimum -> skipped even when frequencies differ wildly */
+    g.pulse_count = FREQ_XCHECK_MIN_COUNTS - 1U;
+    g.freq_hz = 1000.0f;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, freq_calc_cross_check(&p, &g, &rel));
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.0f, rel);
+
+    /* Invalid inputs -> skipped (never a 100% false mismatch) */
+    g.pulse_count = 200ULL;
+    g.freq_hz = 100.0f;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, freq_calc_cross_check(NULL, &g, &rel));
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, freq_calc_cross_check(&p, NULL, &rel));
+    p.valid = false;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, freq_calc_cross_check(&p, &g, NULL));
+    p.valid = true;
+    g.valid = false;
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, freq_calc_cross_check(&p, &g, NULL));
+    g.valid = true;
+    p.freq_hz = 0.0f; /* gate-only style result: period frequency 0 */
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, freq_calc_cross_check(&p, &g, NULL));
+}
+
+TEST_CASE("given edge stream with two lost edges when combined with gate counts then gate frequency replaces the wrong 1/T value and duty is unknown", "[tool_freq][cross_check]")
+{
+    /* 1 kHz 50% duty: edge i at i*500 us, level 1 on even i. */
+    freq_edge_stamp_t good[12];
+    for (size_t i = 0; i < 12U; ++i) {
+        good[i].timestamp_us = (uint64_t)i * 500ULL;
+        good[i].level = (uint8_t)((i % 2U) == 0U ? 1U : 0U);
+    }
+    /* Same stream with edges 4 and 5 lost (merged 1500 us low pulse) */
+    freq_edge_stamp_t lost[10];
+    size_t n = 0;
+    for (size_t i = 0; i < 12U; ++i) {
+        if (i == 4U || i == 5U) {
+            continue;
+        }
+        lost[n++] = good[i];
+    }
+    TEST_ASSERT_EQUAL_UINT32(10U, (uint32_t)n);
+
+    freq_gate_result_t gres = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_gate_counts(200ULL, 100000ULL, FREQ_PCNT_EDGES_BOTH, &gres));
+    TEST_ASSERT_TRUE(gres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 1000.0f, gres.freq_hz);
+
+    freq_period_result_t pres = {0};
+    freq_reading_t reading = {0};
+
+    /* No lost edges: estimators agree, duty stays valid and the reading is reliable */
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(good, 12U, 1000U, &pres));
+    TEST_ASSERT_TRUE(pres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, pres.freq_hz);
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_combine_reading(FREQ_MODE_AUTO, FREQ_METHOD_NONE, &pres, &gres, NULL, &reading));
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_OK, reading.xcheck);
+    TEST_ASSERT_FALSE(reading.unreliable);
+    TEST_ASSERT_TRUE(reading.duty_valid);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 50.0f, reading.duty_pct);
+
+    /* Lost edges: 1/T reads ~800 Hz, gate says 1000 Hz (20% off, tolerance 5%) -> gate wins */
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(lost, n, 1000U, &pres));
+    TEST_ASSERT_TRUE(pres.valid);
+    TEST_ASSERT_FLOAT_WITHIN(5.0f, 800.0f, pres.freq_hz);
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_combine_reading(FREQ_MODE_AUTO, FREQ_METHOD_NONE, &pres, &gres, NULL, &reading));
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_MISMATCH, reading.xcheck);
+    TEST_ASSERT_TRUE(reading.unreliable);
+    TEST_ASSERT_TRUE(reading.signal_detected);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_GATE, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 1000.0f, reading.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 1000.0f, reading.period_us);
+    TEST_ASSERT_FLOAT_WITHIN(5.0f, 60000.0f, reading.rpm);
+    TEST_ASSERT_FALSE(reading.duty_valid);
+    TEST_ASSERT_TRUE(isnan(reading.duty_pct));
+    TEST_ASSERT_TRUE(isnan(reading.pulse_width_us));
+    TEST_ASSERT_TRUE(isnan(reading.low_width_us));
+
+    /* Forced 1/T mode keeps the user's method but is explicitly flagged unreliable with unknown duty */
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_combine_reading(FREQ_MODE_PERIOD_RMT, FREQ_METHOD_NONE, &pres, &gres, NULL, &reading));
+    TEST_ASSERT_TRUE(reading.unreliable);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(5.0f, 800.0f, reading.freq_hz);
+    TEST_ASSERT_FALSE(reading.duty_valid);
+    TEST_ASSERT_TRUE(isnan(reading.duty_pct));
+
+    /* Low-count boundary: 5 Hz over a 1 s gate gives N=10 edges; a +-1 count quantised gate (5.5 Hz)
+     * against a correct 5.0 Hz period stays reliable (tolerance 30%), and a missing gate result is skipped */
+    freq_period_result_t p5 = {.valid = true, .freq_hz = 5.0f, .period_us = 200000.0f,
+                               .pulse_width_us = 100000.0f, .low_width_us = 100000.0f, .duty_pct = 50.0f};
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_gate_counts(11ULL, 1000000ULL, FREQ_PCNT_EDGES_BOTH, &gres));
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_combine_reading(FREQ_MODE_AUTO, FREQ_METHOD_NONE, &p5, &gres, NULL, &reading));
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_OK, reading.xcheck);
+    TEST_ASSERT_FALSE(reading.unreliable);
+    TEST_ASSERT_TRUE(reading.duty_valid);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_combine_reading(FREQ_MODE_AUTO, FREQ_METHOD_NONE, &p5, NULL, NULL, &reading));
+    TEST_ASSERT_EQUAL(FREQ_XCHECK_SKIPPED, reading.xcheck);
+    TEST_ASSERT_TRUE(reading.duty_valid);
+}
+
+TEST_CASE("given 1Hz 2Hz and 5Hz edge streams and narrow slow pulses when period is calculated from timestamps then full-period frequency and duty are exact", "[tool_freq][period][lowfreq]")
+{
+    freq_period_result_t res = {0};
+
+    /* 1 Hz 50%: the minimum useful stream in a 2 s window is 4 edges (3 pulses = 1 full cycle) */
+    const freq_edge_stamp_t hz1[] = {{0ULL, 1U}, {500000ULL, 0U}, {1000000ULL, 1U}, {1500000ULL, 0U}};
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(hz1, 4U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.0f, res.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 50.0f, res.duty_pct);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 60.0f, res.rpm);
+
+    /* Exactly 3 edges (high, low, then the next rising edge) bound one full period */
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(hz1, 3U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_EQUAL_UINT32(1U, res.cycles_measured);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.0f, res.freq_hz);
+
+    /* 2 Hz 50% with 5 edges (2 full cycles) */
+    freq_edge_stamp_t hz2[5];
+    for (size_t i = 0; i < 5U; ++i) {
+        hz2[i].timestamp_us = (uint64_t)i * 250000ULL;
+        hz2[i].level = (uint8_t)((i % 2U) == 0U ? 1U : 0U);
+    }
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(hz2, 5U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_EQUAL_UINT32(2U, res.cycles_measured);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 2.0f, res.freq_hz);
+
+    /* 5 Hz 25% duty, 5 edges */
+    const freq_edge_stamp_t hz5[] = {{0ULL, 1U}, {50000ULL, 0U}, {200000ULL, 1U}, {250000ULL, 0U}, {400000ULL, 1U}};
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(hz5, 5U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 5.0f, res.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 25.0f, res.duty_pct);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 50000.0f, res.pulse_width_us);
+
+    /* 1 Hz tach pulse, 10 ms wide: rise, fall, next rise (3 edges) is enough for 1 Hz and 1% duty */
+    const freq_edge_stamp_t narrow[] = {{0ULL, 1U}, {10000ULL, 0U}, {1000000ULL, 1U}};
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(narrow, 3U, 1000U, &res));
+    TEST_ASSERT_TRUE(res.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.0f, res.freq_hz);
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 1.0f, res.duty_pct);
+
+    /* Only two edges (less than one full period) -> not valid, never a stale or invented value */
+    TEST_ASSERT_EQUAL(ESP_OK, freq_calc_from_edge_timestamps(narrow, 2U, 1000U, &res));
+    TEST_ASSERT_FALSE(res.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, res.freq_hz);
+}
+
+typedef struct {
+    gpio_num_t pin;
+    uint32_t tick_idx;
+    uint32_t period_ticks;
+    uint32_t high_ticks;
+    uint8_t cur_level;
+} slow_pwm_gen_ctx_t;
+
+static void slow_pwm_timer_cb(void *arg)
+{
+    slow_pwm_gen_ctx_t *g = (slow_pwm_gen_ctx_t *)arg;
+    uint32_t phase = g->tick_idx % g->period_ticks;
+    uint8_t next_level = (phase < g->high_ticks) ? 1U : 0U;
+    if (g->tick_idx == 0U || next_level != g->cur_level) {
+        g->cur_level = next_level;
+        tool_freq_record_edge_isr_for_test(g->pin, (uint64_t)esp_timer_get_time(), next_level);
+    }
+    g->tick_idx++;
+}
+
+#define SLOW_TICK_US (5000ULL)
+
+static void freq_test_prepare_live_tool(freq_gate_window_t gate)
+{
+    tool_registry_test_reset();
+    recorder_sink_test_reset();
+    bsp_pin_manager_reset();
+    tool_freq_set_capture_source(NULL, NULL);
+    tool_freq_set_driver_error_for_test(ESP_OK);
+    TEST_ASSERT_EQUAL(ESP_OK, tool_core_init());
+    TEST_ASSERT_EQUAL(ESP_OK, recorder_sink_init());
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_pin(BSP_PIN_PORT_C_TXD2));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_mode(FREQ_MODE_AUTO));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_gate_window(gate));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_edge_acq_max_us(FREQ_EDGE_ACQ_DEFAULT_MAX_US));
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_register());
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_init());
+}
+
+static void freq_test_finish_live_tool(void)
+{
+    (void)ui_shell_go_home(false);
+    (void)tool_freq_set_pin(BSP_PIN_ANALOG_IN_DEFAULT);
+    (void)tool_freq_set_gate_window(FREQ_GATE_100MS);
+    (void)tool_freq_set_mode(FREQ_MODE_AUTO);
+    (void)tool_freq_set_edge_acq_max_us(FREQ_EDGE_ACQ_DEFAULT_MAX_US);
+}
+
+/* Drive a slow periodic signal into the live `freq_c1` worker (100 ms PCNT gate, 2 s edge window). */
+static void run_slow_signal_case(uint32_t period_ticks,
+                                 uint32_t high_ticks,
+                                 float expect_hz,
+                                 float expect_duty_pct,
+                                 float duty_tol_pct,
+                                 uint32_t min_acq_us,
+                                 uint32_t timeout_ms)
+{
+    freq_test_prepare_live_tool(FREQ_GATE_100MS);
+
+    slow_pwm_gen_ctx_t ctx = {
+        .pin = BSP_PIN_PORT_C_TXD2,
+        .tick_idx = 0U,
+        .period_ticks = period_ticks,
+        .high_ticks = high_ticks,
+        .cur_level = 0U,
+    };
+    const esp_timer_create_args_t targs = {
+        .callback = slow_pwm_timer_cb,
+        .arg = &ctx,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "test_slow_pwm",
+    };
+    esp_timer_handle_t timer = NULL;
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_create(&targs, &timer));
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(FREQ_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_start_periodic(timer, SLOW_TICK_US));
+
+    freq_reading_t reading = {0};
+    bool got = false;
+    for (uint32_t waited = 0; waited < timeout_ms; waited += 20U) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        (void)tool_freq_get_latest_reading(&reading);
+        if (reading.signal_detected) {
+            got = true;
+            break;
+        }
+    }
+    freq_window_stats_t stats = {0};
+    tool_freq_get_last_window_stats(&stats);
+    (void)esp_timer_stop(timer);
+    (void)esp_timer_delete(timer);
+    ui_shell_step();
+
+    TEST_ASSERT_TRUE(got);
+    TEST_ASSERT_EQUAL(ESP_OK, reading.hw_error);
+    TEST_ASSERT_FALSE(reading.unreliable);
+    TEST_ASSERT_EQUAL(FREQ_METHOD_PERIOD, reading.active_method);
+    TEST_ASSERT_FLOAT_WITHIN(expect_hz * 0.15f, expect_hz, reading.freq_hz);
+    TEST_ASSERT_TRUE(reading.duty_valid);
+    TEST_ASSERT_FLOAT_WITHIN(duty_tol_pct, expect_duty_pct, reading.duty_pct);
+    /* Edge acquisition ran past the 100 ms gate, but the PCNT gate itself was not stretched */
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(min_acq_us, stats.acq_us);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(FREQ_EDGE_ACQ_DEFAULT_MAX_US + 200000U, stats.acq_us);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT64(90000ULL, reading.gate_duration_us);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT64(160000ULL, reading.gate_duration_us);
+    TEST_ASSERT_FALSE(stats.isr_capped);
+
+    freq_test_finish_live_tool();
+}
+
+TEST_CASE("given live 5Hz 50 percent signal when worker acquires edges beyond the 100ms gate then frequency and duty are measured", "[tool_freq][hardware][lowfreq]")
+{
+    run_slow_signal_case(40U, 20U, 5.0f, 50.0f, 6.0f, 380000U, 6000U);
+}
+
+TEST_CASE("given live 2Hz 50 percent signal when worker acquires edges beyond the 100ms gate then frequency and duty are measured", "[tool_freq][hardware][lowfreq]")
+{
+    run_slow_signal_case(100U, 50U, 2.0f, 50.0f, 6.0f, 950000U, 8000U);
+}
+
+TEST_CASE("given live 1Hz 50 percent signal when worker acquires edges for the bounded 2s window then frequency and duty are measured", "[tool_freq][hardware][lowfreq]")
+{
+    run_slow_signal_case(200U, 100U, 1.0f, 50.0f, 6.0f, 1900000U, 10000U);
+}
+
+TEST_CASE("given live 1Hz tach pulse only 10ms wide when worker acquires edges then frequency and narrow duty are measured", "[tool_freq][hardware][lowfreq]")
+{
+    run_slow_signal_case(200U, 2U, 1.0f, 1.0f, 1.5f, 1900000U, 12000U);
+}
+
+static void same_level_flood_cb(void *arg)
+{
+    gpio_num_t pin = *(const gpio_num_t *)arg;
+    /* Every sample has the same level: only the first is stored, the rest are dropped by the ISR */
+    tool_freq_record_edge_isr_for_test(pin, (uint64_t)esp_timer_get_time(), 1U);
+}
+
+TEST_CASE("given aliased same-level interrupt flood when edge window runs then ISR invocation cap disables the interrupt even though samples are dropped", "[tool_freq][hardware][isr_cap]")
+{
+    freq_test_prepare_live_tool(FREQ_GATE_20MS);
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_set_mode(FREQ_MODE_PERIOD_RMT));
+
+    gpio_num_t pin = BSP_PIN_PORT_C_TXD2;
+    const esp_timer_create_args_t targs = {
+        .callback = same_level_flood_cb,
+        .arg = &pin,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "test_flood",
+    };
+    esp_timer_handle_t timer = NULL;
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_create(&targs, &timer));
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(FREQ_TOOL_ID));
+    TEST_ASSERT_EQUAL(ESP_OK, esp_timer_start_periodic(timer, 200ULL));
+
+    freq_window_stats_t stats = {0};
+    for (int i = 0; i < 100; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        tool_freq_get_last_window_stats(&stats);
+        if (stats.isr_capped) {
+            break;
+        }
+    }
+    (void)esp_timer_stop(timer);
+    (void)esp_timer_delete(timer);
+
+    TEST_ASSERT_TRUE(stats.isr_capped);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(FREQ_EDGE_ISR_MAX_INVOCATIONS, stats.isr_invocations);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(FREQ_EDGE_ISR_MAX_INVOCATIONS + 8U, stats.isr_invocations);
+    TEST_ASSERT_EQUAL_UINT32(1U, stats.edges_stored); /* proves invocations were counted although samples were dropped */
+    /* The cap ends the window instead of waiting out the 2 s edge acquisition */
+    TEST_ASSERT_LESS_THAN_UINT32(1500000U, stats.acq_us);
+
+    freq_reading_t reading = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, tool_freq_get_latest_reading(&reading));
+    TEST_ASSERT_FALSE(reading.signal_detected);
+
+    freq_test_finish_live_tool();
+}
+
+TEST_CASE("given no signal during the long edge acquisition window when tool is stopped then worker cancels within 250ms and joins before buffers are freed", "[tool_freq][hardware][cancel]")
+{
+    freq_test_prepare_live_tool(FREQ_GATE_20MS);
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_open_tool(FREQ_TOOL_ID));
+
+    /* Past the 20 ms gate the worker sits in the 2 s edge wait: no window has completed yet */
+    vTaskDelay(pdMS_TO_TICKS(150));
+    freq_window_stats_t stats = {0};
+    tool_freq_get_last_window_stats(&stats);
+    TEST_ASSERT_EQUAL_UINT32(0U, stats.windows);
+
+    int64_t t0 = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_OK, ui_shell_go_home(false));
+    int64_t elapsed_us = esp_timer_get_time() - t0;
+    TEST_ASSERT_LESS_THAN_INT32(250000, (int32_t)elapsed_us);
+    TEST_ASSERT_FALSE(bsp_pin_is_owned_by(BSP_PIN_PORT_C_TXD2, FREQ_TOOL_ID));
+    TEST_ASSERT_TRUE(heap_caps_check_integrity_all(true));
+
+    freq_test_finish_live_tool();
 }
