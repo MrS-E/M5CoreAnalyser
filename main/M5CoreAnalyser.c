@@ -3,10 +3,12 @@
 #include "bsp_m5core2.h"
 #include "recorder_sink.h"
 #include "tool_core.h"
+#include "tool_analoggen.h"
 #include "tool_freq.h"
 #include "tool_logic.h"
 #include "tool_scope.h"
 #include "tool_voltmeter.h"
+#include "tool_wavegen.h"
 #include "ui_shell.h"
 
 static const char *TAG = "m5core_analyser";
@@ -23,6 +25,8 @@ void app_main(void)
     ESP_ERROR_CHECK(tool_scope_register());
     ESP_ERROR_CHECK(tool_logic_register());
     ESP_ERROR_CHECK(tool_freq_register());
+    ESP_ERROR_CHECK(tool_wavegen_register());
+    ESP_ERROR_CHECK(tool_analoggen_register());
 
     err = ui_shell_init();
     if (err == ESP_OK) {
