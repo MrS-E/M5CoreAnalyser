@@ -46,13 +46,16 @@ All component test suites registered in `test_app/CMakeLists.txt` (`TEST_COMPONE
 ./test_app/run_qemu_tests.sh
 
 # Run QEMU without rebuilding when test_app/build is already up to date:
-./test_app/run_qemu_tests.sh --no-build --timeout 45
+./test_app/run_qemu_tests.sh --no-build --timeout 45 --test-timeout 20
+
+# Exercise the runner's timeout/crash/FAIL parsing using synthetic host processes:
+python3 -m unittest -v test_app/test_qemu_test_runner.py
 ```
 
 #### Test Runner Capabilities & On-Target Execution Constraints
-- **Immediate Completion & Crash Detection**: `test_app/run_qemu_tests.sh` monitors QEMU stdout in real time, terminates QEMU immediately upon seeing `=== Unity Tests Complete` (or on any panic / stack overflow), and reports `Total`, `Passed`, `Failed`, and `Skipped` counts along with every failed test's name, `file:line`, and failure message.
-- **Per-Case Duration Cap**: Each `TEST_CASE` is timed individually (typically `1–1450 ms`) and enforced against a `20 s` per-case cap.
-- **Serial On-Target Unity Execution**: Because ESP-IDF Unity `unity_run_all_tests()` executes inside a single emulated ESP32 FreeRTOS `main` task where tests exercise shared singleton hardware/BSP pin tables, `tool_core` registry state, `recorder_sink`, and the `ui_shell` LVGL display tree, test cases run serially within the QEMU instance (~6.4 s for 43 tests).
+- **Nonblocking Timeout & Cleanup**: The monitor uses nonblocking pipe reads and deadline polling, so both global (`--timeout`, default `60 s`) and per-case (`--test-timeout`, default `20 s`) timeouts fire even if QEMU stops writing output. It terminates/reaps QEMU, retains the complete log at `test_app/build/qemu_unity_output.log`, prints a count summary and active test/error on timeout or crash, and returns nonzero. The shell `EXIT` handler removes the transient merged flash image and reports the phase that failed.
+- **Failure Parsing & Synthetic Coverage**: Completed Unity runs report `Total`, `Passed`, `Failed`, and `Skipped`, including each parsed failure's test name, `file:line`, and assertion message. `test_qemu_test_runner.py` covers silent global timeout, silent per-test timeout, crash attribution, and synthetic Unity `FAIL` parsing.
+- **Serial On-Target Unity Execution**: Unity `unity_run_all_tests()` executes inside one emulated ESP32 FreeRTOS `main` task. Component cases mutate shared singleton BSP pin ownership, `tool_core` registry, `recorder_sink`, and LVGL state, so they must run serially in one QEMU instance; parallel execution of these integration tests is unsafe. Independent host-side runner parser tests are ordinary Python unit tests.
 
 ---
 
