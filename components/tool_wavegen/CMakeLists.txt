@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "tool_wavegen.c"
+        "wavegen_calc.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "priv_include"
+    REQUIRES
+        bsp_m5core2
+        tool_core
+        recorder_sink
+        lvgl
+        esp_driver_ledc
+        esp_driver_mcpwm
+        esp_driver_rmt
+        esp_driver_gpio
+        esp_timer
+        heap
+        freertos
+        log
+)
