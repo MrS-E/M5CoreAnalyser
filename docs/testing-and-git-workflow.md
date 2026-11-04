@@ -39,15 +39,20 @@ ninja -C build
 ```
 
 ### Unity `test_app` Build & On-Target Execution in ESP32 QEMU
-All component test suites registered in `test_app/CMakeLists.txt` (`TEST_COMPONENTS`) can be compiled and executed on the emulated dual-core Xtensa ESP32 machine via `qemu-system-xtensa`:
+All component test suites registered in `test_app/CMakeLists.txt` (`TEST_COMPONENTS`) are built, merged into a 4 MB ESP32 flash image, and executed on the emulated dual-core Xtensa ESP32 machine via the reusable runner script `test_app/run_qemu_tests.sh`:
 
 ```bash
-ninja -C test_app/build
-cd test_app/build
-esptool --chip esp32 merge-bin -o flash_image.bin --pad-to-size 4MB @flash_args
-timeout 10s qemu-system-xtensa -nographic -machine esp32 -drive file=flash_image.bin,if=mtd,format=raw || true
-rm -f flash_image.bin
+# Build test_app incrementally, merge flash_image.bin, run QEMU, and report summary:
+./test_app/run_qemu_tests.sh
+
+# Run QEMU without rebuilding when test_app/build is already up to date:
+./test_app/run_qemu_tests.sh --no-build --timeout 45
 ```
+
+#### Test Runner Capabilities & On-Target Execution Constraints
+- **Immediate Completion & Crash Detection**: `test_app/run_qemu_tests.sh` monitors QEMU stdout in real time, terminates QEMU immediately upon seeing `=== Unity Tests Complete` (or on any panic / stack overflow), and reports `Total`, `Passed`, `Failed`, and `Skipped` counts along with every failed test's name, `file:line`, and failure message.
+- **Per-Case Duration Cap**: Each `TEST_CASE` is timed individually (typically `1–1450 ms`) and enforced against a `20 s` per-case cap.
+- **Serial On-Target Unity Execution**: Because ESP-IDF Unity `unity_run_all_tests()` executes inside a single emulated ESP32 FreeRTOS `main` task where tests exercise shared singleton hardware/BSP pin tables, `tool_core` registry state, `recorder_sink`, and the `ui_shell` LVGL display tree, test cases run serially within the QEMU instance (~6.4 s for 43 tests).
 
 ---
 
